@@ -382,91 +382,105 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="flex h-screen w-full bg-slate-100 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden relative bg-[url('https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=2564&auto=format&fit=crop')] bg-cover bg-center">
+  <div class="flex h-screen w-full bg-slate-100 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden relative bg-[url('https://images.unsplash.com/photo-1557672172-298e090bd0f1?q=80&w=2564&auto=format&fit=crop')] bg-cover bg-center">
     <!-- Backdrop Blur overlay for the whole app -->
-    <div class="absolute inset-0 bg-white/60 dark:bg-slate-900/80 backdrop-blur-3xl"></div>
+    <div class="absolute inset-0 bg-white/40 dark:bg-slate-900/60 backdrop-blur-3xl"></div>
     
-    <!-- Settings Overlay (Glassmorphism) -->
-    <div v-if="showSettings" class="absolute inset-0 z-50 bg-black/20 backdrop-blur-sm flex justify-end transition-opacity">
-      <div class="w-full max-w-md h-full bg-white/70 dark:bg-slate-800/70 backdrop-blur-2xl shadow-2xl flex flex-col p-6 animate-in slide-in-from-right-8 duration-300 border-l border-white/20 dark:border-white/10">
-        <div class="flex items-center justify-between mb-6">
-          <h2 class="text-xl font-bold flex items-center gap-2 drop-shadow-sm">
-            <Settings class="w-5 h-5" />
-            模型与代理配置
-          </h2>
-          <button @click="showSettings = false" class="p-2 hover:bg-white/50 dark:hover:bg-white/10 rounded-full transition shadow-sm border border-transparent hover:border-white/20">
-            <X class="w-5 h-5" />
-          </button>
-        </div>
-
-        <div class="flex-1 overflow-y-auto space-y-5 pr-2 custom-scrollbar">
-          <!-- Provider Selection -->
-          <div class="bg-white/50 dark:bg-slate-900/50 p-4 rounded-2xl border border-white/40 dark:border-white/10 shadow-sm backdrop-blur-md">
-            <div class="flex items-center justify-between mb-3">
-              <label class="text-sm font-bold tracking-wide">选择供应商</label>
-              <button @click="addNewProvider" class="text-blue-600 dark:text-blue-400 hover:text-blue-700 font-medium text-xs flex items-center gap-1 bg-blue-50/50 dark:bg-blue-900/20 px-2 py-1 rounded-md transition">
-                <Plus class="w-3 h-3" /> 添加
-              </button>
-            </div>
-            <div class="flex gap-2">
-              <div class="relative flex-1">
-                <select v-model="selectedProviderId" class="w-full pl-3 pr-8 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition appearance-none shadow-inner backdrop-blur-md font-medium">
-                  <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
-                </select>
-                <ChevronDown class="w-4 h-4 absolute right-3 top-3 text-slate-500 pointer-events-none" />
-              </div>
-              <button @click="removeProvider(selectedProviderId)" class="p-2.5 shrink-0 bg-red-50/80 text-red-600 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-900/50 rounded-xl transition border border-red-100 dark:border-red-900/30 shadow-sm" title="删除当前供应商">
+    <!-- Settings Overlay (Glassmorphism Dual Pane) -->
+    <div v-if="showSettings" class="absolute inset-0 z-50 bg-black/30 backdrop-blur-sm flex items-center justify-center transition-opacity p-4 md:p-8">
+      <div class="w-full max-w-4xl h-[85vh] bg-white/70 dark:bg-slate-800/70 backdrop-blur-2xl shadow-2xl flex rounded-3xl overflow-hidden animate-in zoom-in-95 duration-300 border border-white/40 dark:border-white/10">
+        
+        <!-- Left Pane: Provider List -->
+        <div class="w-64 border-r border-white/30 dark:border-white/5 bg-white/30 dark:bg-slate-900/30 flex flex-col">
+          <div class="p-5 border-b border-white/20 dark:border-white/5 shrink-0 flex justify-between items-center">
+            <h3 class="font-bold text-lg drop-shadow-sm">模型供应商</h3>
+            <button @click="addNewProvider" class="p-1.5 bg-blue-600/10 text-blue-600 hover:bg-blue-600/20 dark:bg-blue-400/10 dark:text-blue-400 dark:hover:bg-blue-400/20 rounded-lg transition" title="添加供应商">
+              <Plus class="w-4 h-4" />
+            </button>
+          </div>
+          <div class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
+            <div v-for="p in providers" :key="p.id"
+                 @click="selectedProviderId = p.id"
+                 class="group relative flex items-center justify-between p-3 rounded-xl cursor-pointer transition-all duration-200 border"
+                 :class="[
+                   selectedProviderId === p.id 
+                     ? 'bg-white/80 dark:bg-slate-800/80 border-white/60 dark:border-white/10 shadow-sm text-blue-700 dark:text-blue-400 font-bold' 
+                     : 'bg-transparent border-transparent hover:bg-white/50 dark:hover:bg-white/10 text-slate-600 dark:text-slate-400 font-medium'
+                 ]">
+              <span class="truncate pr-6">{{ p.name }}</span>
+              <button @click.stop="removeProvider(p.id)" class="absolute right-3 opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-opacity">
                 <Trash2 class="w-4 h-4" />
               </button>
             </div>
           </div>
-
-          <!-- Provider Settings -->
-          <div class="space-y-4 bg-white/30 dark:bg-slate-900/30 p-4 rounded-2xl border border-white/30 dark:border-white/5 shadow-sm backdrop-blur-md">
-            <div>
-              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5 ml-1">供应商名称</label>
-              <input v-model="currentProvider.name" type="text" class="w-full px-3 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md" placeholder="例如：OpenAI" />
-            </div>
-            <div>
-              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5 ml-1">API Base URL</label>
-              <input v-model="currentProvider.baseURL" type="text" class="w-full px-3 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm" placeholder="https://api.openai.com/v1" />
-            </div>
-            <div>
-              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5 ml-1">API Key</label>
-              <input v-model="currentProvider.apiKey" type="password" class="w-full px-3 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm tracking-widest" placeholder="sk-..." />
-            </div>
-            
-            <div class="pt-4 mt-2 border-t border-slate-200/50 dark:border-slate-700/50">
-              <div class="flex items-end gap-2">
-                <div class="flex-1 relative">
-                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5 ml-1">选择模型</label>
-                  <select v-model="selectedModel" class="w-full pl-3 pr-8 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition appearance-none shadow-inner backdrop-blur-md font-medium">
-                    <option v-for="model in currentProvider.models" :key="model" :value="model">{{ model }}</option>
-                  </select>
-                  <ChevronDown class="w-4 h-4 absolute right-3 top-8 text-slate-500 pointer-events-none" />
-                </div>
-                <button @click="fetchModels" :disabled="isFetchingModels" class="p-2.5 shrink-0 bg-white/60 dark:bg-slate-800/60 hover:bg-white dark:hover:bg-slate-700 rounded-xl transition border border-white/40 dark:border-white/10 shadow-sm backdrop-blur-md" title="一键获取可用模型列表">
-                  <RefreshCw :class="['w-5 h-5 text-blue-600 dark:text-blue-400', isFetchingModels ? 'animate-spin' : '']" />
-                </button>
-              </div>
-              <div class="mt-3">
-                <label class="block text-[11px] font-medium mb-1.5 ml-1 text-slate-500 dark:text-slate-400">不在列表中？手动输入并回车添加</label>
-                <input v-model="selectedModel" @keydown.enter="currentProvider.models.includes(selectedModel) ? null : currentProvider.models.push(selectedModel)" type="text" class="w-full px-3 py-2 bg-white/40 dark:bg-slate-800/40 border border-white/40 dark:border-white/10 rounded-lg focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md text-sm" placeholder="手动输入模型名称..." />
-              </div>
-            </div>
-
-            <div class="pt-4 mt-2 border-t border-slate-200/50 dark:border-slate-700/50">
-              <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5 ml-1">System Prompt</label>
-              <textarea v-model="systemPrompt" rows="4" class="w-full px-3 py-2.5 bg-white/60 dark:bg-slate-800/60 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition resize-none shadow-inner backdrop-blur-md text-sm leading-relaxed"></textarea>
-            </div>
-          </div>
         </div>
 
-        <div class="mt-6 pt-4 border-t border-slate-200/50 dark:border-slate-700/50">
-          <button @click="saveConfig" class="w-full flex items-center justify-center gap-2 bg-blue-600/90 hover:bg-blue-600 text-white px-4 py-3 rounded-xl transition font-medium shadow-lg shadow-blue-600/20 backdrop-blur-md border border-blue-500/50">
-            <Check class="w-5 h-5" />
-            保存并应用配置
-          </button>
+        <!-- Right Pane: Provider Details -->
+        <div class="flex-1 flex flex-col relative bg-gradient-to-br from-white/40 to-white/10 dark:from-slate-800/40 dark:to-slate-900/10">
+          <div class="absolute top-4 right-4 z-10">
+            <button @click="showSettings = false" class="p-2 bg-white/50 dark:bg-slate-800/50 hover:bg-white/80 dark:hover:bg-slate-700/80 rounded-full transition shadow-sm border border-white/40 dark:border-white/10 backdrop-blur-md">
+              <X class="w-5 h-5 text-slate-600 dark:text-slate-300" />
+            </button>
+          </div>
+
+          <div class="flex-1 overflow-y-auto p-8 custom-scrollbar">
+            <div class="max-w-xl mx-auto space-y-6">
+              <div class="mb-8">
+                <h2 class="text-2xl font-bold flex items-center gap-2 drop-shadow-sm">
+                  <Settings class="w-6 h-6 text-blue-600 dark:text-blue-400" />
+                  配置详情
+                </h2>
+                <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">管理您当前选中的供应商及其参数。</p>
+              </div>
+
+              <!-- Provider Details Form -->
+              <div class="space-y-5 bg-white/40 dark:bg-slate-900/40 p-6 rounded-3xl border border-white/40 dark:border-white/5 shadow-sm backdrop-blur-xl">
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">供应商名称</label>
+                  <input v-model="currentProvider.name" type="text" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-medium text-base" placeholder="例如：OpenAI" />
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">API Base URL</label>
+                  <input v-model="currentProvider.baseURL" type="text" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm" placeholder="https://api.openai.com/v1" />
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">API Key</label>
+                  <input v-model="currentProvider.apiKey" type="password" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm tracking-widest" placeholder="sk-..." />
+                </div>
+                
+                <div class="pt-5 mt-3 border-t border-slate-200/50 dark:border-slate-700/50">
+                  <div class="flex items-end gap-3">
+                    <div class="flex-1 relative">
+                      <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">默认使用模型</label>
+                      <select v-model="selectedModel" class="w-full pl-4 pr-10 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition appearance-none shadow-inner backdrop-blur-md font-medium text-base text-blue-700 dark:text-blue-400">
+                        <option v-for="model in currentProvider.models" :key="model" :value="model">{{ model }}</option>
+                      </select>
+                      <ChevronDown class="w-5 h-5 absolute right-4 top-9 text-blue-500 pointer-events-none" />
+                    </div>
+                    <button @click="fetchModels" :disabled="isFetchingModels" class="p-3.5 shrink-0 bg-white/80 dark:bg-slate-700/80 hover:bg-white dark:hover:bg-slate-600 rounded-2xl transition border border-white/50 dark:border-white/20 shadow-sm backdrop-blur-md flex items-center justify-center" title="一键获取可用模型列表">
+                      <RefreshCw :class="['w-5 h-5 text-blue-600 dark:text-blue-400', isFetchingModels ? 'animate-spin' : '']" />
+                    </button>
+                  </div>
+                  <div class="mt-4">
+                    <label class="block text-[11px] font-bold uppercase tracking-wide mb-2 ml-1 text-slate-500 dark:text-slate-400">手动添加模型 (输入后回车)</label>
+                    <input v-model="selectedModel" @keydown.enter.prevent="currentProvider.models.includes(selectedModel) ? null : currentProvider.models.push(selectedModel)" type="text" class="w-full px-4 py-2.5 bg-white/40 dark:bg-slate-800/40 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md text-sm font-medium" placeholder="手动输入模型名称..." />
+                  </div>
+                </div>
+
+                <div class="pt-5 mt-3 border-t border-slate-200/50 dark:border-slate-700/50">
+                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">System Prompt</label>
+                  <textarea v-model="systemPrompt" rows="4" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition resize-none shadow-inner backdrop-blur-md text-sm leading-relaxed font-medium"></textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="p-6 border-t border-white/20 dark:border-white/5 bg-white/30 dark:bg-slate-900/30 backdrop-blur-xl shrink-0 flex justify-end">
+            <button @click="saveConfig" class="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-2xl transition font-bold shadow-xl shadow-blue-600/30 backdrop-blur-md border border-blue-400/50 transform hover:-translate-y-0.5">
+              <Check class="w-5 h-5" />
+              保存并应用配置
+            </button>
+          </div>
         </div>
       </div>
     </div>
