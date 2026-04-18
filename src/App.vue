@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
-import { Send, Settings, Terminal, Check, Loader2, Bot, User, X } from 'lucide-vue-next'
+import { Send, Settings, Terminal, Check, Loader2, Bot, User, X, MessageSquare, Plus, Trash2, RefreshCw } from 'lucide-vue-next'
 import MarkdownIt from 'markdown-it'
 
 const md = new MarkdownIt()
@@ -10,6 +10,7 @@ const messages = ref<any[]>([])
 const input = ref('')
 const isLoading = ref(false)
 const showSettings = ref(false)
+const isSidebarOpen = ref(true)
 
 // Config
 const config = ref({
@@ -18,6 +19,123 @@ const config = ref({
   model: localStorage.getItem('kuke_model') || 'gpt-3.5-turbo',
   systemPrompt: localStorage.getItem('kuke_system') || '你是一个全能的本地 AI Agent，可以调用本地工具（如读取文件、执行终端指令）。'
 })
+
+// Provider configuration
+const availableModels = ref<string[]>([
+  'gpt-3.5-turbo', 'gpt-4o', 'gpt-4-turbo', 
+  'deepseek-chat', 'deepseek-coder'
+])
+const isFetchingModels = ref(false)
+
+const fetchModels = async () => {
+  if (!config.value.baseURL) return
+  isFetchingModels.value = true
+  try {
+    const res = await (window as any).localTools.getModels({
+      apiKey: config.value.apiKey,
+      baseURL: config.value.baseURL
+    })
+    if (res.success && res.data) {
+      const fetchedModels = res.data.map((m: any) => m.id)
+      // Merge unique models
+      const combined = new Set([...availableModels.value, ...fetchedModels])
+      availableModels.value = Array.from(combined).sort()
+      // If current model not in list, update it
+      if (!availableModels.value.includes(config.value.model) && availableModels.value.length > 0) {
+        config.value.model = availableModels.value[0]
+      }
+    } else {
+      alert(`获取模型列表失败: ${res.error}`)
+    }
+  } catch (error: any) {
+    alert(`请求出错: ${error.message}`)
+  } finally {
+    isFetchingModels.value = false
+  }
+}
+
+// Session Management
+interface ChatSession {
+  id: string
+  title: string
+  messages: any[]
+  updatedAt: number
+}
+
+const sessions = ref<ChatSession[]>([])
+const currentSessionId = ref<string>('')
+
+const saveSessionsToStorage = () => {
+  localStorage.setItem('kuke_sessions', JSON.stringify(sessions.value))
+}
+
+const loadSessionsFromStorage = () => {
+  const stored = localStorage.getItem('kuke_sessions')
+  if (stored) {
+    try {
+      sessions.value = JSON.parse(stored)
+    } catch (e) {
+      sessions.value = []
+    }
+  }
+  if (sessions.value.length === 0) {
+    createNewSession()
+  } else {
+    // Load most recent
+    sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
+    switchSession(sessions.value[0].id)
+  }
+}
+
+const createNewSession = () => {
+  const newSession: ChatSession = {
+    id: Date.now().toString(),
+    title: '新对话',
+    messages: [],
+    updatedAt: Date.now()
+  }
+  sessions.value.unshift(newSession)
+  switchSession(newSession.id)
+  saveSessionsToStorage()
+}
+
+const switchSession = (id: string) => {
+  const session = sessions.value.find(s => s.id === id)
+  if (session) {
+    currentSessionId.value = id
+    messages.value = session.messages || []
+    setTimeout(() => scrollToBottom(), 100)
+  }
+}
+
+const deleteSession = (id: string, event: Event) => {
+  event.stopPropagation()
+  sessions.value = sessions.value.filter(s => s.id !== id)
+  if (sessions.value.length === 0) {
+    createNewSession()
+  } else if (currentSessionId.value === id) {
+    switchSession(sessions.value[0].id)
+  }
+  saveSessionsToStorage()
+}
+
+const updateCurrentSession = () => {
+  const session = sessions.value.find(s => s.id === currentSessionId.value)
+  if (session) {
+    session.messages = messages.value
+    session.updatedAt = Date.now()
+    // Auto generate title based on first user message if title is default
+    if (session.title === '新对话' && messages.value.length > 0) {
+      const firstUserMsg = messages.value.find(m => m.role === 'user')
+      if (firstUserMsg) {
+        session.title = firstUserMsg.content.substring(0, 15) + (firstUserMsg.content.length > 15 ? '...' : '')
+      }
+    }
+    // Re-sort
+    sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
+    saveSessionsToStorage()
+  }
+}
 
 // Save Config
 const saveConfig = () => {
@@ -191,6 +309,8 @@ const sendMessage = async () => {
       messages.value.push({ role: 'assistant', content: message.content || '' })
     }
 
+    updateCurrentSession()
+
   } catch (error: any) {
     messages.value.push({ role: 'system', content: `❌ 请求失败: ${error.message}` })
   } finally {
@@ -200,26 +320,33 @@ const sendMessage = async () => {
 }
 
 onMounted(() => {
+  loadSessionsFromStorage()
+
   // Check if we're in ZTools environment
   if (!(window as any).localTools) {
-    messages.value.push({ 
-      role: 'system', 
-      content: '⚠️ 警告: 未检测到 `localTools`，请确保您在 ZTools 插件环境中运行，否则文件和终端工具将无法使用。您可以进行常规的聊天。'
-    })
+    if (messages.value.length === 0) {
+      messages.value.push({ 
+        role: 'system', 
+        content: '⚠️ 警告: 未检测到 `localTools`，请确保您在 ZTools 插件环境中运行，否则文件和终端工具将无法使用。您可以进行常规的聊天。'
+      })
+    }
   } else {
-    messages.value.push({ 
-      role: 'assistant', 
-      content: '你好！我是你的全能本地 AI Agent。我已经连接了本地系统，你可以让我帮你读取文件、管理项目或是执行终端命令！'
-    })
+    if (messages.value.length === 0) {
+      messages.value.push({ 
+        role: 'assistant', 
+        content: '你好！我是你的全能本地 AI Agent。我已经连接了本地系统，你可以让我帮你读取文件、管理项目或是执行终端命令！'
+      })
+    }
   }
+  updateCurrentSession()
 })
 </script>
 
 <template>
-  <div class="flex h-screen w-full bg-slate-50 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden">
+  <div class="flex h-screen w-full bg-slate-50 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden relative">
     
     <!-- Sidebar / Settings Overlay -->
-    <div v-if="showSettings" class="absolute inset-0 z-20 bg-black/50 backdrop-blur-sm flex justify-end transition-opacity">
+    <div v-if="showSettings" class="absolute inset-0 z-50 bg-black/50 backdrop-blur-sm flex justify-end transition-opacity">
       <div class="w-full max-w-md h-full bg-white dark:bg-slate-800 shadow-2xl flex flex-col p-6 animate-in slide-in-from-right-8 duration-300">
         <div class="flex items-center justify-between mb-6">
           <h2 class="text-xl font-bold flex items-center gap-2">
@@ -240,12 +367,23 @@ onMounted(() => {
             <label class="block text-sm font-medium mb-1">API Key</label>
             <input v-model="config.apiKey" type="password" class="w-full px-3 py-2 border rounded-lg dark:bg-slate-900 dark:border-slate-700 focus:ring-2 focus:ring-blue-500 outline-none transition" placeholder="sk-..." />
           </div>
+          <div class="flex items-end gap-2">
+            <div class="flex-1">
+              <label class="block text-sm font-medium mb-1">Model Name</label>
+              <select v-model="config.model" class="w-full px-3 py-2 border rounded-lg dark:bg-slate-900 dark:border-slate-700 focus:ring-2 focus:ring-blue-500 outline-none transition appearance-none">
+                <option v-for="model in availableModels" :key="model" :value="model">{{ model }}</option>
+              </select>
+            </div>
+            <button @click="fetchModels" :disabled="isFetchingModels" class="p-2.5 shrink-0 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 rounded-lg transition border dark:border-slate-600" title="获取模型列表">
+              <RefreshCw :class="['w-5 h-5 text-slate-600 dark:text-slate-300', isFetchingModels ? 'animate-spin' : '']" />
+            </button>
+          </div>
           <div>
-            <label class="block text-sm font-medium mb-1">Model Name</label>
+            <label class="block text-sm font-medium mb-1 text-slate-500">如果列表中没有您的模型，您可以手动输入</label>
             <input v-model="config.model" type="text" class="w-full px-3 py-2 border rounded-lg dark:bg-slate-900 dark:border-slate-700 focus:ring-2 focus:ring-blue-500 outline-none transition" placeholder="gpt-4o / deepseek-chat" />
           </div>
           <div>
-            <label class="block text-sm font-medium mb-1">System Prompt</label>
+            <label class="block text-sm font-medium mb-1 mt-4">System Prompt</label>
             <textarea v-model="config.systemPrompt" rows="4" class="w-full px-3 py-2 border rounded-lg dark:bg-slate-900 dark:border-slate-700 focus:ring-2 focus:ring-blue-500 outline-none transition resize-none"></textarea>
           </div>
         </div>
@@ -259,17 +397,51 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Main Chat Area -->
-    <div class="flex-1 flex flex-col h-full relative">
+    <!-- Sidebar -->
+    <aside :class="[
+      'bg-slate-100 dark:bg-slate-900/50 border-r dark:border-slate-800 transition-all duration-300 flex flex-col',
+      isSidebarOpen ? 'w-64' : 'w-0 overflow-hidden'
+    ]">
+      <div class="p-3 flex items-center justify-between border-b dark:border-slate-800 h-14 shrink-0 whitespace-nowrap">
+        <span class="font-bold pl-1" v-show="isSidebarOpen">会话历史</span>
+        <button @click="createNewSession" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-lg transition" title="新建对话">
+          <Plus class="w-4 h-4" />
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto p-2 space-y-1">
+        <div v-for="session in sessions" :key="session.id"
+             @click="switchSession(session.id)"
+             :class="[
+               'group flex items-center justify-between p-2.5 rounded-lg cursor-pointer transition-colors',
+               currentSessionId === session.id 
+                 ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' 
+                 : 'hover:bg-slate-200 dark:hover:bg-slate-800/80 text-slate-600 dark:text-slate-400'
+             ]">
+          <div class="flex items-center gap-2 overflow-hidden">
+            <MessageSquare class="w-4 h-4 shrink-0" />
+            <span class="text-sm truncate">{{ session.title }}</span>
+          </div>
+          <button @click="(e) => deleteSession(session.id, e)" class="opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-opacity">
+            <Trash2 class="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <div class="flex-1 flex flex-col h-full relative min-w-0">
       <!-- Header -->
       <header class="h-14 shrink-0 border-b dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md flex items-center justify-between px-4 sticky top-0 z-10">
         <div class="flex items-center gap-3">
+          <button @click="isSidebarOpen = !isSidebarOpen" class="p-1.5 -ml-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition">
+            <Menu class="w-5 h-5 text-slate-500" />
+          </button>
           <div class="w-8 h-8 rounded-lg bg-blue-600 text-white flex items-center justify-center shadow-lg shadow-blue-500/30">
             <Bot class="w-5 h-5" />
           </div>
           <div>
             <h1 class="font-bold leading-none">Kuke Agent</h1>
-            <p class="text-xs text-slate-500 mt-0.5">你的本地专属全能 AI</p>
+            <p class="text-xs text-slate-500 mt-0.5">{{ config.model }}</p>
           </div>
         </div>
         <button @click="showSettings = true" class="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-full transition group" title="设置">

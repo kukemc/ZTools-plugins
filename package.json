@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "pack": "node scripts/pack.js && powershell -Command \"cd pack; Compress-Archive -Path * -DestinationPath ../kuke-ai-agent.zip -Force\""
   },
   "dependencies": {
     "@types/markdown-it": "^14.1.2",

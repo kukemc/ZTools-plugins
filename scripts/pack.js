@@ -1,0 +1,72 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const rootDir = path.join(__dirname, '..');
+const packDir = path.join(rootDir, 'pack');
+
+console.log('开始准备打包环境...');
+
+// 1. Clean pack dir
+if (fs.existsSync(packDir)) {
+  fs.rmSync(packDir, { recursive: true, force: true });
+}
+fs.mkdirSync(packDir, { recursive: true });
+
+// 2. Copy necessary files
+const filesToCopy = ['plugin.json', 'preload.js', 'logo.png'];
+for (const file of filesToCopy) {
+  const src = path.join(rootDir, file);
+  if (fs.existsSync(src)) {
+    fs.copyFileSync(src, path.join(packDir, file));
+    console.log(`复制文件: ${file}`);
+  } else {
+    console.warn(`警告: 找不到文件 ${file}`);
+  }
+}
+
+// 3. Copy dist directory
+const copyRecursiveSync = (src, dest) => {
+  if (!fs.existsSync(src)) return;
+  const stats = fs.statSync(src);
+  if (stats.isDirectory()) {
+    if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
+    fs.readdirSync(src).forEach(childItemName => {
+      copyRecursiveSync(path.join(src, childItemName), path.join(dest, childItemName));
+    });
+  } else {
+    fs.copyFileSync(src, dest);
+  }
+};
+
+const distDir = path.join(rootDir, 'dist');
+if (fs.existsSync(distDir)) {
+  copyRecursiveSync(distDir, path.join(packDir, 'dist'));
+  console.log('复制目录: dist');
+} else {
+  console.error('错误: 找不到 dist 目录，请先执行 npm run build');
+  process.exit(1);
+}
+
+// 4. Create package.json for production dependencies
+const originalPkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf-8'));
+const prodPkg = {
+  name: originalPkg.name,
+  version: originalPkg.version,
+  type: "commonjs", // 确保 preload.js 能正常使用 require
+  dependencies: {
+    openai: originalPkg.dependencies.openai
+  }
+};
+fs.writeFileSync(path.join(packDir, 'package.json'), JSON.stringify(prodPkg, null, 2));
+console.log('生成生产环境 package.json');
+
+// 5. Install production dependencies
+console.log('安装生产依赖...');
+execSync('npm install', { cwd: packDir, stdio: 'inherit' });
+
+console.log('打包环境准备完毕！');

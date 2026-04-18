@@ -1,0 +1,8 @@
+{
+  "name": "kukeagent",
+  "version": "0.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "openai": "^6.34.0"
+  }
+}
