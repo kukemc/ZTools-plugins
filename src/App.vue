@@ -1,18 +1,36 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, computed } from 'vue'
-import { Send, Settings, Terminal, Check, Loader2, Bot, User, X, MessageSquare, Plus, Trash2, RefreshCw, ChevronDown } from 'lucide-vue-next'
+import { computed, nextTick, onMounted, ref } from 'vue'
+import {
+  Bot,
+  Check,
+  ChevronDown,
+  Loader2,
+  Menu,
+  MessageSquare,
+  Plus,
+  RefreshCw,
+  Send,
+  Settings,
+  Terminal,
+  Trash2,
+  User,
+  X,
+} from 'lucide-vue-next'
 import MarkdownIt from 'markdown-it'
 
-const md = new MarkdownIt()
+const md = new MarkdownIt({
+  breaks: true,
+  linkify: true,
+})
 
-// State
-const messages = ref<any[]>([])
-const input = ref('')
-const isLoading = ref(false)
-const showSettings = ref(false)
-const isSidebarOpen = ref(true)
+type MessageRole = 'assistant' | 'user' | 'system'
 
-// Config Data Types
+interface ChatMessage {
+  role: MessageRole
+  content: string
+  createdAt: number
+}
+
 interface Provider {
   id: string
   name: string
@@ -21,181 +39,124 @@ interface Provider {
   models: string[]
 }
 
-const defaultProviders: Provider[] = [
-  { id: 'openai', name: 'OpenAI', baseURL: 'https://api.openai.com/v1', apiKey: '', models: ['gpt-3.5-turbo', 'gpt-4o', 'gpt-4-turbo'] },
-  { id: 'deepseek', name: 'DeepSeek', baseURL: 'https://api.deepseek.com/v1', apiKey: '', models: ['deepseek-chat', 'deepseek-coder'] }
+interface ChatSession {
+  id: string
+  title: string
+  messages: ChatMessage[]
+  updatedAt: number
+}
+
+const createMessage = (role: MessageRole, content: string): ChatMessage => ({
+  role,
+  content,
+  createdAt: Date.now(),
+})
+
+const normalizeMessages = (value: unknown): ChatMessage[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .filter(Boolean)
+    .map((message, index) => {
+      const current = message as Partial<ChatMessage>
+      return {
+        role: (current.role ?? 'system') as MessageRole,
+        content: String(current.content ?? ''),
+        createdAt: Number(current.createdAt ?? Date.now() + index),
+      }
+    })
+}
+
+const createDefaultProviders = (): Provider[] => [
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    baseURL: 'https://api.openai.com/v1',
+    apiKey: '',
+    models: ['gpt-3.5-turbo', 'gpt-4o', 'gpt-4-turbo'],
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseURL: 'https://api.deepseek.com/v1',
+    apiKey: '',
+    models: ['deepseek-chat', 'deepseek-coder'],
+  },
 ]
 
 const loadProviders = (): Provider[] => {
   const stored = localStorage.getItem('kuke_providers')
-  if (stored) {
-    try { return JSON.parse(stored) } catch(e) { return defaultProviders }
+  if (!stored) {
+    return createDefaultProviders()
   }
-  return defaultProviders
-}
 
-const providers = ref<Provider[]>(loadProviders())
-const selectedProviderId = ref(localStorage.getItem('kuke_provider_id') || providers.value[0].id)
-const selectedModel = ref(localStorage.getItem('kuke_model') || providers.value[0].models[0])
-const systemPrompt = ref(localStorage.getItem('kuke_system') || '你是一个全能的本地 AI Agent，可以调用本地工具（如读取文件、执行终端指令）。')
-
-// Computed config based on selected provider
-const currentProvider = computed(() => providers.value.find(p => p.id === selectedProviderId.value) || providers.value[0])
-
-const saveConfig = () => {
-  localStorage.setItem('kuke_providers', JSON.stringify(providers.value))
-  localStorage.setItem('kuke_provider_id', selectedProviderId.value)
-  localStorage.setItem('kuke_model', selectedModel.value)
-  localStorage.setItem('kuke_system', systemPrompt.value)
-  showSettings.value = false
-}
-
-// Provider Management Methods
-const addNewProvider = () => {
-  const newId = 'provider_' + Date.now()
-  providers.value.push({
-    id: newId,
-    name: 'New Provider',
-    baseURL: 'https://',
-    apiKey: '',
-    models: ['default-model']
-  })
-  selectedProviderId.value = newId
-}
-
-const removeProvider = (id: string) => {
-  if (providers.value.length <= 1) return alert('至少保留一个供应商')
-  providers.value = providers.value.filter(p => p.id !== id)
-  if (selectedProviderId.value === id) {
-    selectedProviderId.value = providers.value[0].id
-    selectedModel.value = providers.value[0].models[0]
-  }
-}
-
-// Fetch Models for current provider
-const isFetchingModels = ref(false)
-const fetchModels = async () => {
-  if (!currentProvider.value.baseURL || !currentProvider.value.apiKey) {
-    return alert('请先填写完整的 Base URL 和 API Key')
-  }
-  isFetchingModels.value = true
   try {
-    const res = await (window as any).localTools.getModels({
-      apiKey: currentProvider.value.apiKey,
-      baseURL: currentProvider.value.baseURL
-    })
-    if (res.success && res.data) {
-      const fetchedModels = res.data.map((m: any) => m.id)
-      const combined = new Set([...currentProvider.value.models, ...fetchedModels])
-      currentProvider.value.models = Array.from(combined).sort()
-      if (!currentProvider.value.models.includes(selectedModel.value)) {
-        selectedModel.value = currentProvider.value.models[0]
-      }
-      alert('获取模型列表成功！')
-    } else {
-      alert(`获取失败: ${res.error}`)
-    }
-  } catch (error: any) {
-    alert(`请求出错: ${error.message}`)
-  } finally {
-    isFetchingModels.value = false
+    const parsed = JSON.parse(stored)
+    return Array.isArray(parsed) && parsed.length ? parsed : createDefaultProviders()
+  } catch {
+    return createDefaultProviders()
   }
 }
 
-// Session Management
-interface ChatSession {
-  id: string
-  title: string
-  messages: any[]
-  updatedAt: number
-}
-
-const sessions = ref<ChatSession[]>([])
-const currentSessionId = ref<string>('')
-
-const saveSessionsToStorage = () => {
-  localStorage.setItem('kuke_sessions', JSON.stringify(sessions.value))
-}
-
-const loadSessionsFromStorage = () => {
-  const stored = localStorage.getItem('kuke_sessions')
-  if (stored) {
-    try {
-      sessions.value = JSON.parse(stored)
-    } catch (e) {
-      sessions.value = []
-    }
-  }
-  if (sessions.value.length === 0) {
-    createNewSession()
-  } else {
-    // Load most recent
-    sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
-    switchSession(sessions.value[0].id)
-  }
-}
-
-const createNewSession = () => {
-  const newSession: ChatSession = {
-    id: Date.now().toString(),
-    title: '新对话',
-    messages: [],
-    updatedAt: Date.now()
-  }
-  sessions.value.unshift(newSession)
-  switchSession(newSession.id)
-  saveSessionsToStorage()
-}
-
-const switchSession = (id: string) => {
-  const session = sessions.value.find(s => s.id === id)
-  if (session) {
-    currentSessionId.value = id
-    messages.value = session.messages || []
-    setTimeout(() => scrollToBottom(), 100)
-  }
-}
-
-const deleteSession = (id: string, event: Event) => {
-  event.stopPropagation()
-  sessions.value = sessions.value.filter(s => s.id !== id)
-  if (sessions.value.length === 0) {
-    createNewSession()
-  } else if (currentSessionId.value === id) {
-    switchSession(sessions.value[0].id)
-  }
-  saveSessionsToStorage()
-}
-
-const updateCurrentSession = () => {
-  const session = sessions.value.find(s => s.id === currentSessionId.value)
-  if (session) {
-    session.messages = messages.value
-    session.updatedAt = Date.now()
-    // Auto generate title based on first user message if title is default
-    if (session.title === '新对话' && messages.value.length > 0) {
-      const firstUserMsg = messages.value.find(m => m.role === 'user')
-      if (firstUserMsg) {
-        session.title = firstUserMsg.content.substring(0, 15) + (firstUserMsg.content.length > 15 ? '...' : '')
-      }
-    }
-    // Re-sort
-    sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
-    saveSessionsToStorage()
-  }
-}
-
-// Auto-scroll
+const messages = ref<ChatMessage[]>([])
+const input = ref('')
+const manualModelInput = ref('')
+const isLoading = ref(false)
+const showSettings = ref(false)
+const isSidebarOpen = ref(true)
+const isFetchingModels = ref(false)
+const environmentReady = ref(false)
 const chatContainer = ref<HTMLElement | null>(null)
-const scrollToBottom = () => {
-  nextTick(() => {
-    if (chatContainer.value) {
-      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
-    }
-  })
-}
+const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const notice = ref<{ type: 'success' | 'error' | 'info'; text: string } | null>(null)
+const providers = ref<Provider[]>(loadProviders())
+const selectedProviderId = ref(localStorage.getItem('kuke_provider_id') || providers.value[0]?.id || 'openai')
+const selectedModel = ref(localStorage.getItem('kuke_model') || providers.value[0]?.models[0] || '')
+const systemPrompt = ref(
+  localStorage.getItem('kuke_system') ||
+    '你是一个全能的本地 AI Agent，可以调用本地工具（如读取文件、执行终端指令）。',
+)
+const sessions = ref<ChatSession[]>([])
+const currentSessionId = ref('')
 
-// Tool definitions for OpenAI
+let noticeTimer: ReturnType<typeof setTimeout> | undefined
+
+const currentProvider = computed(
+  () => providers.value.find((provider) => provider.id === selectedProviderId.value) || providers.value[0],
+)
+const activeSession = computed(
+  () => sessions.value.find((session) => session.id === currentSessionId.value) || null,
+)
+const sessionCount = computed(() => sessions.value.length)
+const messageCount = computed(() => messages.value.filter((message) => message.role !== 'system').length)
+const environmentLabel = computed(() => (environmentReady.value ? '插件环境已连接' : '浏览器预览模式'))
+const composerPlaceholder = computed(() =>
+  environmentReady.value ? '描述你的任务，或让 Agent 读取文件、执行命令…' : '输入问题或提示词…',
+)
+
+const suggestedPrompts = [
+  {
+    title: '分析当前项目结构',
+    description: '扫描目录并总结关键入口、依赖与风险点。',
+    prompt: '请先读取当前项目结构，并总结关键入口文件、依赖和潜在问题。',
+    icon: Terminal,
+  },
+  {
+    title: '优化本地插件体验',
+    description: '聚焦界面布局、交互层级与配置流程。',
+    prompt: '请审查当前插件界面，并给出可执行的 UI/UX 优化建议。',
+    icon: Settings,
+  },
+  {
+    title: '生成执行方案',
+    description: '把复杂目标拆解成清晰步骤后再开始。',
+    prompt: '请根据我的需求先生成分步骤执行方案，再开始实现。',
+    icon: Bot,
+  },
+]
+
 const tools = [
   {
     type: 'function',
@@ -205,11 +166,11 @@ const tools = [
       parameters: {
         type: 'object',
         properties: {
-          dirPath: { type: 'string', description: '目录的绝对路径或相对路径' }
+          dirPath: { type: 'string', description: '目录的绝对路径或相对路径' },
         },
-        required: ['dirPath']
-      }
-    }
+        required: ['dirPath'],
+      },
+    },
   },
   {
     type: 'function',
@@ -219,11 +180,11 @@ const tools = [
       parameters: {
         type: 'object',
         properties: {
-          filePath: { type: 'string', description: '文件的绝对路径或相对路径' }
+          filePath: { type: 'string', description: '文件的绝对路径或相对路径' },
         },
-        required: ['filePath']
-      }
-    }
+        required: ['filePath'],
+      },
+    },
   },
   {
     type: 'function',
@@ -234,124 +195,409 @@ const tools = [
         type: 'object',
         properties: {
           filePath: { type: 'string', description: '文件的绝对路径或相对路径' },
-          content: { type: 'string', description: '要写入的文件内容' }
+          content: { type: 'string', description: '要写入的文件内容' },
         },
-        required: ['filePath', 'content']
-      }
-    }
+        required: ['filePath', 'content'],
+      },
+    },
   },
   {
     type: 'function',
     function: {
       name: 'execCommand',
-      description: '在终端执行系统指令，如 npm install, ls, dir 等',
+      description: '在终端执行系统指令，如 npm install、dir 等',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: '要执行的终端指令' },
-          cwd: { type: 'string', description: '执行指令的当前工作目录（可选）' }
+          cwd: { type: 'string', description: '执行指令的当前工作目录（可选）' },
         },
-        required: ['command']
-      }
-    }
-  }
+        required: ['command'],
+      },
+    },
+  },
 ]
 
-// Chat Logic
+const showNotice = (text: string, type: 'success' | 'error' | 'info' = 'info') => {
+  notice.value = { text, type }
+  if (noticeTimer) {
+    clearTimeout(noticeTimer)
+  }
+  noticeTimer = setTimeout(() => {
+    notice.value = null
+  }, 3200)
+}
+
+const ensureProviderSelection = () => {
+  if (!providers.value.length) {
+    providers.value = createDefaultProviders()
+  }
+
+  if (!providers.value.some((provider) => provider.id === selectedProviderId.value)) {
+    selectedProviderId.value = providers.value[0].id
+  }
+
+  const provider = providers.value.find((item) => item.id === selectedProviderId.value)
+  if (!provider) {
+    return
+  }
+
+  if (!provider.models.includes(selectedModel.value)) {
+    selectedModel.value = provider.models[0] || ''
+  }
+}
+
+const persistConfig = () => {
+  localStorage.setItem('kuke_providers', JSON.stringify(providers.value))
+  localStorage.setItem('kuke_provider_id', selectedProviderId.value)
+  localStorage.setItem('kuke_model', selectedModel.value)
+  localStorage.setItem('kuke_system', systemPrompt.value)
+}
+
+const saveConfig = () => {
+  ensureProviderSelection()
+  persistConfig()
+  showSettings.value = false
+  showNotice('模型配置已保存并应用。', 'success')
+}
+
+const focusComposer = () => {
+  nextTick(() => {
+    textareaRef.value?.focus()
+  })
+}
+
+const scrollToBottom = () => {
+  nextTick(() => {
+    if (chatContainer.value) {
+      chatContainer.value.scrollTop = chatContainer.value.scrollHeight
+    }
+  })
+}
+
+const formatTimestamp = (value: number) =>
+  new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+
+const formatSessionTime = (value: number) => {
+  const date = new Date(value)
+  const today = new Date()
+  const isToday = date.toDateString() === today.toDateString()
+
+  return new Intl.DateTimeFormat('zh-CN', isToday ? { hour: '2-digit', minute: '2-digit' } : { month: 'numeric', day: 'numeric' }).format(date)
+}
+
+const roleLabel = (role: MessageRole) => {
+  if (role === 'user') return '你'
+  if (role === 'system') return '系统'
+  return 'Kuke Agent'
+}
+
+const buildSessionTitle = (content: string) => {
+  const summary = content.replace(/\s+/g, ' ').trim()
+  if (!summary) {
+    return '新对话'
+  }
+  return summary.length > 18 ? `${summary.slice(0, 18)}…` : summary
+}
+
+const saveSessionsToStorage = () => {
+  localStorage.setItem('kuke_sessions', JSON.stringify(sessions.value))
+}
+
+const updateCurrentSession = () => {
+  const session = sessions.value.find((item) => item.id === currentSessionId.value)
+  if (!session) {
+    return
+  }
+
+  session.messages = [...messages.value]
+  session.updatedAt = Date.now()
+
+  const firstUserMessage = messages.value.find((message) => message.role === 'user')
+  if (firstUserMessage) {
+    session.title = buildSessionTitle(firstUserMessage.content)
+  }
+
+  sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
+  saveSessionsToStorage()
+}
+
+const switchSession = (id: string) => {
+  const session = sessions.value.find((item) => item.id === id)
+  if (!session) {
+    return
+  }
+
+  currentSessionId.value = id
+  messages.value = normalizeMessages(session.messages)
+
+  if (window.innerWidth < 768) {
+    isSidebarOpen.value = false
+  }
+
+  scrollToBottom()
+}
+
+const createNewSession = () => {
+  const newSession: ChatSession = {
+    id: Date.now().toString(),
+    title: '新对话',
+    messages: [],
+    updatedAt: Date.now(),
+  }
+
+  sessions.value.unshift(newSession)
+  switchSession(newSession.id)
+  saveSessionsToStorage()
+  focusComposer()
+}
+
+const deleteSession = (id: string, event: Event) => {
+  event.stopPropagation()
+  sessions.value = sessions.value.filter((session) => session.id !== id)
+
+  if (!sessions.value.length) {
+    createNewSession()
+    return
+  }
+
+  if (currentSessionId.value === id) {
+    switchSession(sessions.value[0].id)
+  }
+
+  saveSessionsToStorage()
+}
+
+const loadSessionsFromStorage = () => {
+  const stored = localStorage.getItem('kuke_sessions')
+
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored)
+      sessions.value = Array.isArray(parsed)
+        ? parsed.map((session) => ({
+            ...session,
+            messages: normalizeMessages((session as Partial<ChatSession>).messages),
+          }))
+        : []
+    } catch {
+      sessions.value = []
+    }
+  }
+
+  if (!sessions.value.length) {
+    createNewSession()
+    return
+  }
+
+  sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
+  switchSession(sessions.value[0].id)
+}
+
+const selectProvider = (id: string) => {
+  selectedProviderId.value = id
+  ensureProviderSelection()
+}
+
+const addManualModel = () => {
+  const nextModel = manualModelInput.value.trim()
+  if (!nextModel) {
+    return
+  }
+
+  if (!currentProvider.value.models.includes(nextModel)) {
+    currentProvider.value.models = [...currentProvider.value.models, nextModel].sort()
+    showNotice('已添加自定义模型。', 'success')
+  }
+
+  selectedModel.value = nextModel
+  manualModelInput.value = ''
+}
+
+const addNewProvider = () => {
+  const newId = `provider_${Date.now()}`
+  providers.value.push({
+    id: newId,
+    name: '新供应商',
+    baseURL: 'https://',
+    apiKey: '',
+    models: ['default-model'],
+  })
+  selectedProviderId.value = newId
+  selectedModel.value = 'default-model'
+  manualModelInput.value = ''
+}
+
+const removeProvider = (id: string) => {
+  if (providers.value.length <= 1) {
+    showNotice('至少保留一个供应商。', 'error')
+    return
+  }
+
+  providers.value = providers.value.filter((provider) => provider.id !== id)
+
+  if (selectedProviderId.value === id) {
+    selectedProviderId.value = providers.value[0].id
+    selectedModel.value = providers.value[0].models[0] || ''
+  }
+}
+
+const fetchModels = async () => {
+  if (!currentProvider.value.baseURL || !currentProvider.value.apiKey) {
+    showNotice('请先填写完整的 Base URL 与 API Key。', 'error')
+    return
+  }
+
+  const modelFetcher = (window as any).localTools?.getModels
+  if (typeof modelFetcher !== 'function') {
+    showNotice('当前环境不支持获取模型列表。', 'error')
+    return
+  }
+
+  isFetchingModels.value = true
+  try {
+    const response = await modelFetcher({
+      apiKey: currentProvider.value.apiKey,
+      baseURL: currentProvider.value.baseURL,
+    })
+
+    if (!response.success || !response.data) {
+      throw new Error(response.error || '未返回模型数据')
+    }
+
+    const fetchedModels = response.data.map((model: { id: string }) => model.id)
+    currentProvider.value.models = Array.from(new Set([...currentProvider.value.models, ...fetchedModels])).sort()
+
+    if (!currentProvider.value.models.includes(selectedModel.value)) {
+      selectedModel.value = currentProvider.value.models[0] || ''
+    }
+
+    showNotice('模型列表已同步。', 'success')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '获取模型失败'
+    showNotice(message, 'error')
+  } finally {
+    isFetchingModels.value = false
+  }
+}
+
+const applyPrompt = (prompt: string) => {
+  input.value = prompt
+  focusComposer()
+}
+
 const sendMessage = async () => {
-  if (!input.value.trim() || isLoading.value) return
-  
-  const userMessage = input.value
-  messages.value.push({ role: 'user', content: userMessage })
+  const content = input.value.trim()
+  if (!content || isLoading.value) {
+    return
+  }
+
+  const chat = (window as any).localTools?.chat
+  if (typeof chat !== 'function') {
+    showNotice('未检测到插件运行环境，当前无法发起聊天请求。', 'error')
+    return
+  }
+
+  messages.value.push(createMessage('user', content))
   input.value = ''
   isLoading.value = true
+  updateCurrentSession()
   scrollToBottom()
 
   try {
-    // Construct conversation history
     const apiMessages: any[] = [
       { role: 'system', content: systemPrompt.value },
-      ...messages.value.map(m => ({ role: m.role, content: m.content }))
+      ...messages.value
+        .filter((message) => message.role !== 'system')
+        .map(({ role, content: messageContent }) => ({ role, content: messageContent })),
     ]
 
-    const response = await (window as any).localTools.chat(
-      { apiKey: currentProvider.value.apiKey, baseURL: currentProvider.value.baseURL, model: selectedModel.value },
+    const response = await chat(
+      {
+        apiKey: currentProvider.value.apiKey,
+        baseURL: currentProvider.value.baseURL,
+        model: selectedModel.value,
+      },
       apiMessages,
-      tools
+      tools,
     )
 
     if (!response.success) {
-      throw new Error(response.error)
+      throw new Error(response.error || '请求失败')
     }
 
     const message = response.data
 
-    if (message.tool_calls) {
-      // AI decided to call a tool
+    if (message.tool_calls?.length) {
+      apiMessages.push(message)
+
       for (const toolCall of message.tool_calls) {
         const functionName = toolCall.function.name
-        const args = JSON.parse(toolCall.function.arguments)
-        
-        let toolResult = ''
-        
-        // Notify UI about tool execution
-        messages.value.push({ 
-          role: 'system', 
-          content: `🔧 执行工具: **${functionName}**\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``
-        })
+        const args = JSON.parse(toolCall.function.arguments || '{}')
+        const availableTool = (window as any).localTools?.[functionName]
+
+        messages.value.push(
+          createMessage(
+            'system',
+            `工具调用：**${functionName}**\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``,
+          ),
+        )
         scrollToBottom()
 
-        // Call preload.js tools
-        if ((window as any).localTools && (window as any).localTools[functionName]) {
+        let toolResult = ''
+
+        if (typeof availableTool === 'function') {
           if (functionName === 'execCommand') {
-            const res = await (window as any).localTools.execCommand(args.command, args.cwd)
-            toolResult = JSON.stringify(res)
+            const result = await availableTool(args.command, args.cwd)
+            toolResult = JSON.stringify(result)
           } else {
-            const res = (window as any).localTools[functionName](...Object.values(args))
-            toolResult = JSON.stringify(res)
+            const result = await availableTool(...Object.values(args))
+            toolResult = JSON.stringify(result)
           }
         } else {
-          toolResult = '错误：当前环境未提供此本地工具，请确保在 ZTools 环境中运行。'
+          toolResult = '错误：当前环境未提供此本地工具。'
         }
 
-        // Return tool output to AI
-        apiMessages.push(message)
         apiMessages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
           name: functionName,
-          content: toolResult
+          content: toolResult,
         })
-        
-        // Notify UI about tool result
-        messages.value.push({ 
-          role: 'system', 
-          content: `✅ 工具执行结果:\n\`\`\`json\n${toolResult.substring(0, 500)}${toolResult.length > 500 ? '...' : ''}\n\`\`\``
-        })
+
+        messages.value.push(
+          createMessage(
+            'system',
+            `工具结果：\n\n\`\`\`json\n${toolResult.substring(0, 1000)}${toolResult.length > 1000 ? '...' : ''}\n\`\`\``,
+          ),
+        )
         scrollToBottom()
       }
 
-      // Final response from AI
-      const secondResponse = await (window as any).localTools.chat(
-        { apiKey: currentProvider.value.apiKey, baseURL: currentProvider.value.baseURL, model: selectedModel.value },
+      const secondResponse = await chat(
+        {
+          apiKey: currentProvider.value.apiKey,
+          baseURL: currentProvider.value.baseURL,
+          model: selectedModel.value,
+        },
         apiMessages,
-        null // no tools on the second pass usually
+        null,
       )
 
       if (!secondResponse.success) {
-        throw new Error(secondResponse.error)
+        throw new Error(secondResponse.error || '工具调用后续响应失败')
       }
 
-      messages.value.push({ role: 'assistant', content: secondResponse.data.content || '' })
+      messages.value.push(createMessage('assistant', secondResponse.data.content || ''))
     } else {
-      // Normal response
-      messages.value.push({ role: 'assistant', content: message.content || '' })
+      messages.value.push(createMessage('assistant', message.content || ''))
     }
 
     updateCurrentSession()
-
-  } catch (error: any) {
-    messages.value.push({ role: 'system', content: `❌ 请求失败: ${error.message}` })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '请求失败'
+    messages.value.push(createMessage('system', `请求失败：${message}`))
+    showNotice(message, 'error')
   } finally {
     isLoading.value = false
     scrollToBottom()
@@ -359,285 +605,493 @@ const sendMessage = async () => {
 }
 
 onMounted(() => {
+  ensureProviderSelection()
   loadSessionsFromStorage()
+  environmentReady.value = Boolean((window as any).localTools?.chat)
 
-  // Check if we're in ZTools environment
-  if (!(window as any).localTools) {
-    if (messages.value.length === 0) {
-      messages.value.push({ 
-        role: 'system', 
-        content: '⚠️ 警告: 未检测到 `localTools`，请确保您在 ZTools 插件环境中运行，否则文件和终端工具将无法使用。您可以进行常规的聊天。'
-      })
-    }
-  } else {
-    if (messages.value.length === 0) {
-      messages.value.push({ 
-        role: 'assistant', 
-        content: '你好！我是你的全能本地 AI Agent。我已经连接了本地系统，你可以让我帮你读取文件、管理项目或是执行终端命令！'
-      })
-    }
+  if (!environmentReady.value) {
+    showNotice('当前处于浏览器预览模式，聊天与本地工具需在插件环境中使用。', 'info')
   }
-  updateCurrentSession()
+
+  focusComposer()
 })
 </script>
 
 <template>
-  <div class="flex h-screen w-full bg-slate-100 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden relative bg-[url('https://images.unsplash.com/photo-1557672172-298e090bd0f1?q=80&w=2564&auto=format&fit=crop')] bg-cover bg-center">
-    <!-- Backdrop Blur overlay for the whole app -->
-    <div class="absolute inset-0 bg-white/40 dark:bg-slate-900/60 backdrop-blur-3xl"></div>
-    
-    <!-- Settings Overlay (Glassmorphism Dual Pane) -->
-    <div v-if="showSettings" class="absolute inset-0 z-50 bg-black/30 backdrop-blur-sm flex items-center justify-center transition-opacity p-4 md:p-8">
-      <div class="w-full max-w-4xl h-[85vh] bg-white/70 dark:bg-slate-800/70 backdrop-blur-2xl shadow-2xl flex rounded-3xl overflow-hidden animate-in zoom-in-95 duration-300 border border-white/40 dark:border-white/10">
-        
-        <!-- Left Pane: Provider List -->
-        <div class="w-64 border-r border-white/30 dark:border-white/5 bg-white/30 dark:bg-slate-900/30 flex flex-col">
-          <div class="p-5 border-b border-white/20 dark:border-white/5 shrink-0 flex justify-between items-center">
-            <h3 class="font-bold text-lg drop-shadow-sm">模型供应商</h3>
-            <button @click="addNewProvider" class="p-1.5 bg-blue-600/10 text-blue-600 hover:bg-blue-600/20 dark:bg-blue-400/10 dark:text-blue-400 dark:hover:bg-blue-400/20 rounded-lg transition" title="添加供应商">
-              <Plus class="w-4 h-4" />
-            </button>
-          </div>
-          <div class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
-            <div v-for="p in providers" :key="p.id"
-                 @click="selectedProviderId = p.id"
-                 class="group relative flex items-center justify-between p-3 rounded-xl cursor-pointer transition-all duration-200 border"
-                 :class="[
-                   selectedProviderId === p.id 
-                     ? 'bg-white/80 dark:bg-slate-800/80 border-white/60 dark:border-white/10 shadow-sm text-blue-700 dark:text-blue-400 font-bold' 
-                     : 'bg-transparent border-transparent hover:bg-white/50 dark:hover:bg-white/10 text-slate-600 dark:text-slate-400 font-medium'
-                 ]">
-              <span class="truncate pr-6">{{ p.name }}</span>
-              <button @click.stop="removeProvider(p.id)" class="absolute right-3 opacity-0 group-hover:opacity-100 p-1 hover:text-red-500 transition-opacity">
-                <Trash2 class="w-4 h-4" />
+  <div class="relative flex h-screen overflow-hidden p-3 sm:p-4">
+    <div class="pointer-events-none absolute inset-0 overflow-hidden">
+      <div class="ambient-orb ambient-orb-primary"></div>
+      <div class="ambient-orb ambient-orb-secondary"></div>
+      <div class="ambient-grid"></div>
+    </div>
+
+    <div class="app-shell">
+      <button
+        v-if="isSidebarOpen"
+        type="button"
+        class="absolute inset-0 z-20 bg-slate-950/30 backdrop-blur-sm md:hidden"
+        aria-label="关闭侧边栏"
+        @click="isSidebarOpen = false"
+      ></button>
+
+      <div
+        v-if="showSettings"
+        class="absolute inset-0 z-40 flex items-center justify-center p-3 sm:p-6"
+      >
+        <button
+          type="button"
+          class="absolute inset-0 bg-slate-950/45 backdrop-blur-md"
+          aria-label="关闭设置"
+          @click="showSettings = false"
+        ></button>
+
+        <section class="settings-shell">
+          <aside class="settings-sidebar">
+            <div class="settings-sidebar-header">
+              <div>
+                <p class="eyebrow">配置中心</p>
+                <h2 class="text-lg font-semibold">模型供应商</h2>
+              </div>
+              <button type="button" class="ui-icon-btn" aria-label="添加供应商" @click="addNewProvider">
+                <Plus class="h-4 w-4" />
+              </button>
+            </div>
+
+            <div class="custom-scrollbar flex-1 space-y-2 overflow-y-auto px-3 pb-3">
+              <div
+                v-for="provider in providers"
+                :key="provider.id"
+                role="button"
+                tabindex="0"
+                class="provider-item"
+                :class="{ 'provider-item-active': selectedProviderId === provider.id }"
+                @click="selectProvider(provider.id)"
+                @keydown.enter.prevent="selectProvider(provider.id)"
+                @keydown.space.prevent="selectProvider(provider.id)"
+              >
+                <div class="min-w-0 flex-1 text-left">
+                  <p class="truncate text-sm font-medium">{{ provider.name }}</p>
+                  <p class="truncate text-xs text-[var(--text-muted)]">{{ provider.baseURL || '未配置地址' }}</p>
+                </div>
+                <button
+                  type="button"
+                  class="provider-item-delete"
+                  aria-label="删除供应商"
+                  @click.stop="removeProvider(provider.id)"
+                >
+                  <Trash2 class="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </aside>
+
+          <div class="flex min-h-0 flex-1 flex-col">
+            <div class="settings-main-header">
+              <div>
+                <p class="eyebrow">细节设置</p>
+                <h3 class="text-xl font-semibold">{{ currentProvider.name }}</h3>
+                <p class="mt-1 text-sm text-[var(--text-muted)]">统一管理接口地址、鉴权与默认模型。</p>
+              </div>
+              <button type="button" class="ui-icon-btn" aria-label="关闭设置" @click="showSettings = false">
+                <X class="h-4 w-4" />
+              </button>
+            </div>
+
+            <div class="custom-scrollbar flex-1 overflow-y-auto p-4 sm:p-6">
+              <div class="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+                <section class="surface-panel p-5 sm:p-6">
+                  <div class="space-y-5">
+                    <div>
+                      <label class="ui-label" for="provider-name">供应商名称</label>
+                      <input id="provider-name" v-model="currentProvider.name" type="text" class="ui-input" placeholder="例如 OpenAI 或自定义网关" />
+                    </div>
+
+                    <div>
+                      <label class="ui-label" for="provider-url">API Base URL</label>
+                      <input id="provider-url" v-model="currentProvider.baseURL" type="text" class="ui-input ui-input-mono" placeholder="https://api.openai.com/v1" />
+                    </div>
+
+                    <div>
+                      <label class="ui-label" for="provider-key">API Key</label>
+                      <input id="provider-key" v-model="currentProvider.apiKey" type="password" class="ui-input ui-input-mono" placeholder="sk-..." />
+                    </div>
+                  </div>
+                </section>
+
+                <section class="surface-panel p-5 sm:p-6">
+                  <div class="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <p class="eyebrow">模型策略</p>
+                      <h4 class="text-base font-semibold">默认模型与同步</h4>
+                    </div>
+                    <button
+                      type="button"
+                      class="ui-icon-btn"
+                      :disabled="isFetchingModels"
+                      aria-label="获取模型列表"
+                      @click="fetchModels"
+                    >
+                      <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': isFetchingModels }" />
+                    </button>
+                  </div>
+
+                  <div class="space-y-4">
+                    <div class="relative">
+                      <label class="ui-label" for="default-model">默认使用模型</label>
+                      <select id="default-model" v-model="selectedModel" class="ui-select">
+                        <option v-for="model in currentProvider.models" :key="model" :value="model">{{ model }}</option>
+                      </select>
+                      <ChevronDown class="pointer-events-none absolute right-4 top-[2.85rem] h-4 w-4 text-[var(--text-muted)]" />
+                    </div>
+
+                    <div>
+                      <label class="ui-label" for="manual-model">手动添加模型</label>
+                      <div class="flex gap-3">
+                        <input
+                          id="manual-model"
+                          v-model="manualModelInput"
+                          type="text"
+                          class="ui-input"
+                          placeholder="输入模型名称后回车或点击添加"
+                          @keydown.enter.prevent="addManualModel"
+                        />
+                        <button type="button" class="ui-btn-secondary px-4" @click="addManualModel">添加</button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+
+              <section class="surface-panel mt-4 p-5 sm:p-6">
+                <div class="mb-4">
+                  <p class="eyebrow">对话基线</p>
+                  <h4 class="text-base font-semibold">System Prompt</h4>
+                  <p class="mt-1 text-sm text-[var(--text-muted)]">用于定义 Agent 的默认角色、工具权限边界与输出风格。</p>
+                </div>
+                <textarea
+                  v-model="systemPrompt"
+                  rows="6"
+                  class="ui-textarea"
+                  placeholder="描述 Agent 的角色、目标与约束…"
+                ></textarea>
+              </section>
+            </div>
+
+            <div class="settings-footer">
+              <button type="button" class="ui-btn-secondary px-5" @click="showSettings = false">取消</button>
+              <button type="button" class="ui-btn-primary px-5" @click="saveConfig">
+                <Check class="h-4 w-4" />
+                保存配置
               </button>
             </div>
           </div>
+        </section>
+      </div>
+
+      <aside
+        :class="[
+          'absolute inset-y-0 left-0 z-30 flex w-[304px] max-w-[88vw] flex-col overflow-hidden border-r border-[var(--border)] bg-[var(--surface-elevated)]/95 backdrop-blur-2xl transition-all duration-300 md:static md:z-auto md:max-w-none',
+          isSidebarOpen ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0 md:w-0 md:border-r-0',
+        ]"
+      >
+        <div class="p-4">
+          <section class="surface-panel p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="eyebrow">桌面 AI 工作台</p>
+                <h1 class="text-xl font-semibold tracking-tight">Kuke Agent</h1>
+                <p class="mt-2 text-sm leading-6 text-[var(--text-muted)]">
+                  面向本地工具协作的极简 Agent 界面，聚焦会话、执行与配置一致性。
+                </p>
+              </div>
+              <div class="brand-mark">
+                <Bot class="h-5 w-5" />
+              </div>
+            </div>
+
+            <div class="mt-4 grid grid-cols-3 gap-3">
+              <div class="stat-card">
+                <span class="stat-label">会话</span>
+                <strong class="stat-value">{{ sessionCount }}</strong>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">消息</span>
+                <strong class="stat-value">{{ messageCount }}</strong>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">环境</span>
+                <strong class="stat-value text-xs">{{ environmentReady ? '已连接' : '预览' }}</strong>
+              </div>
+            </div>
+
+            <button type="button" class="ui-btn-primary mt-4 w-full" @click="createNewSession">
+              <Plus class="h-4 w-4" />
+              新建会话
+            </button>
+          </section>
         </div>
 
-        <!-- Right Pane: Provider Details -->
-        <div class="flex-1 flex flex-col relative bg-gradient-to-br from-white/40 to-white/10 dark:from-slate-800/40 dark:to-slate-900/10">
-          <div class="absolute top-4 right-4 z-10">
-            <button @click="showSettings = false" class="p-2 bg-white/50 dark:bg-slate-800/50 hover:bg-white/80 dark:hover:bg-slate-700/80 rounded-full transition shadow-sm border border-white/40 dark:border-white/10 backdrop-blur-md">
-              <X class="w-5 h-5 text-slate-600 dark:text-slate-300" />
-            </button>
+        <div class="flex min-h-0 flex-1 flex-col px-4 pb-4">
+          <div class="mb-3 flex items-center justify-between px-1">
+            <p class="eyebrow">最近会话</p>
+            <span class="text-xs text-[var(--text-subtle)]">{{ sessions.length }} 条</span>
           </div>
 
-          <div class="flex-1 overflow-y-auto p-8 custom-scrollbar">
-            <div class="max-w-xl mx-auto space-y-6">
-              <div class="mb-8">
-                <h2 class="text-2xl font-bold flex items-center gap-2 drop-shadow-sm">
-                  <Settings class="w-6 h-6 text-blue-600 dark:text-blue-400" />
-                  配置详情
+          <div class="custom-scrollbar flex-1 space-y-2 overflow-y-auto pr-1">
+            <div
+              v-for="session in sessions"
+              :key="session.id"
+              role="button"
+              tabindex="0"
+              class="session-item"
+              :class="{ 'session-item-active': currentSessionId === session.id }"
+              @click="switchSession(session.id)"
+              @keydown.enter.prevent="switchSession(session.id)"
+              @keydown.space.prevent="switchSession(session.id)"
+            >
+              <div class="flex min-w-0 items-start gap-3">
+                <div class="session-item-icon">
+                  <MessageSquare class="h-4 w-4" />
+                </div>
+                <div class="min-w-0 flex-1 text-left">
+                  <p class="truncate text-sm font-medium">{{ session.title }}</p>
+                  <p class="mt-1 text-xs text-[var(--text-muted)]">
+                    {{ session.messages.length }} 条消息 · {{ formatSessionTime(session.updatedAt) }}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="session-delete"
+                aria-label="删除会话"
+                @click="(event) => deleteSession(session.id, event)"
+              >
+                <Trash2 class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          <section class="surface-muted mt-4 p-4">
+            <p class="eyebrow">能力概览</p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <span class="ui-chip">本地文件</span>
+              <span class="ui-chip">终端命令</span>
+              <span class="ui-chip">多模型</span>
+              <span class="ui-chip">Markdown</span>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <main class="relative z-10 flex min-w-0 flex-1 flex-col">
+        <header class="px-3 pb-3 pt-3 sm:px-4 sm:pb-4 sm:pt-4">
+          <div class="surface-panel flex items-center justify-between gap-3 px-4 py-3">
+            <div class="flex min-w-0 items-center gap-3">
+              <button type="button" class="ui-icon-btn" aria-label="切换侧边栏" @click="isSidebarOpen = !isSidebarOpen">
+                <Menu class="h-4 w-4" />
+              </button>
+
+              <div class="min-w-0">
+                <p class="eyebrow">当前会话</p>
+                <h2 class="truncate text-base font-semibold sm:text-lg">
+                  {{ activeSession?.title || '新对话' }}
                 </h2>
-                <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">管理您当前选中的供应商及其参数。</p>
               </div>
+            </div>
 
-              <!-- Provider Details Form -->
-              <div class="space-y-5 bg-white/40 dark:bg-slate-900/40 p-6 rounded-3xl border border-white/40 dark:border-white/5 shadow-sm backdrop-blur-xl">
-                <div>
-                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">供应商名称</label>
-                  <input v-model="currentProvider.name" type="text" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-medium text-base" placeholder="例如：OpenAI" />
-                </div>
-                <div>
-                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">API Base URL</label>
-                  <input v-model="currentProvider.baseURL" type="text" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm" placeholder="https://api.openai.com/v1" />
-                </div>
-                <div>
-                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">API Key</label>
-                  <input v-model="currentProvider.apiKey" type="password" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md font-mono text-sm tracking-widest" placeholder="sk-..." />
-                </div>
-                
-                <div class="pt-5 mt-3 border-t border-slate-200/50 dark:border-slate-700/50">
-                  <div class="flex items-end gap-3">
-                    <div class="flex-1 relative">
-                      <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">默认使用模型</label>
-                      <select v-model="selectedModel" class="w-full pl-4 pr-10 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition appearance-none shadow-inner backdrop-blur-md font-medium text-base text-blue-700 dark:text-blue-400">
-                        <option v-for="model in currentProvider.models" :key="model" :value="model">{{ model }}</option>
-                      </select>
-                      <ChevronDown class="w-5 h-5 absolute right-4 top-9 text-blue-500 pointer-events-none" />
+            <div class="flex items-center gap-2">
+              <span class="status-chip" :class="environmentReady ? 'status-chip-success' : 'status-chip-muted'">
+                {{ environmentLabel }}
+              </span>
+              <span class="status-chip hidden lg:inline-flex">{{ currentProvider.name }}</span>
+              <span class="status-chip hidden xl:inline-flex">{{ selectedModel }}</span>
+              <button type="button" class="ui-icon-btn" aria-label="打开设置" @click="showSettings = true">
+                <Settings class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        </header>
+
+        <section class="relative min-h-0 flex-1 px-3 sm:px-4">
+          <div ref="chatContainer" class="chat-scroll custom-scrollbar surface-panel min-h-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
+            <div v-if="messages.length === 0" class="mx-auto flex min-h-full max-w-5xl items-center">
+              <div class="grid w-full gap-5 xl:grid-cols-[1.2fr_0.8fr]">
+                <section class="surface-panel-strong p-6 sm:p-8">
+                  <div class="inline-flex items-center gap-2 rounded-full border border-[var(--border-strong)] bg-white/70 px-3 py-1 text-xs font-medium text-[var(--text-muted)] dark:bg-white/10">
+                    <Bot class="h-3.5 w-3.5" />
+                    现代极简工作台
+                  </div>
+                  <h3 class="mt-5 max-w-2xl text-3xl font-semibold tracking-tight sm:text-4xl">
+                    用统一、清晰且高信噪比的界面管理你的本地 AI Agent。
+                  </h3>
+                  <p class="mt-4 max-w-2xl text-sm leading-7 text-[var(--text-muted)] sm:text-base">
+                    左侧聚焦会话与能力概览，右侧集中处理消息流、工具执行与模型配置，让复杂操作更易读、更稳、更可控。
+                  </p>
+
+                  <div class="mt-6 flex flex-wrap gap-2">
+                    <span class="status-chip">{{ currentProvider.name }}</span>
+                    <span class="status-chip">{{ selectedModel }}</span>
+                    <span class="status-chip" :class="environmentReady ? 'status-chip-success' : 'status-chip-muted'">
+                      {{ environmentLabel }}
+                    </span>
+                  </div>
+
+                  <div class="mt-8 grid gap-3 sm:grid-cols-3">
+                    <div class="feature-tile">
+                      <Terminal class="h-5 w-5" />
+                      <div>
+                        <p class="font-medium">执行命令</p>
+                        <p class="mt-1 text-xs leading-5 text-[var(--text-muted)]">支持终端指令与结果回传。</p>
+                      </div>
                     </div>
-                    <button @click="fetchModels" :disabled="isFetchingModels" class="p-3.5 shrink-0 bg-white/80 dark:bg-slate-700/80 hover:bg-white dark:hover:bg-slate-600 rounded-2xl transition border border-white/50 dark:border-white/20 shadow-sm backdrop-blur-md flex items-center justify-center" title="一键获取可用模型列表">
-                      <RefreshCw :class="['w-5 h-5 text-blue-600 dark:text-blue-400', isFetchingModels ? 'animate-spin' : '']" />
-                    </button>
+                    <div class="feature-tile">
+                      <MessageSquare class="h-5 w-5" />
+                      <div>
+                        <p class="font-medium">结构化会话</p>
+                        <p class="mt-1 text-xs leading-5 text-[var(--text-muted)]">自动保留历史并按最近活动排序。</p>
+                      </div>
+                    </div>
+                    <div class="feature-tile">
+                      <Settings class="h-5 w-5" />
+                      <div>
+                        <p class="font-medium">集中配置</p>
+                        <p class="mt-1 text-xs leading-5 text-[var(--text-muted)]">统一管理网关、模型与 Prompt。</p>
+                      </div>
+                    </div>
                   </div>
-                  <div class="mt-4">
-                    <label class="block text-[11px] font-bold uppercase tracking-wide mb-2 ml-1 text-slate-500 dark:text-slate-400">手动添加模型 (输入后回车)</label>
-                    <input v-model="selectedModel" @keydown.enter.prevent="currentProvider.models.includes(selectedModel) ? null : currentProvider.models.push(selectedModel)" type="text" class="w-full px-4 py-2.5 bg-white/40 dark:bg-slate-800/40 border border-white/40 dark:border-white/10 rounded-xl focus:ring-2 focus:ring-blue-500/50 outline-none transition shadow-inner backdrop-blur-md text-sm font-medium" placeholder="手动输入模型名称..." />
-                  </div>
-                </div>
+                </section>
 
-                <div class="pt-5 mt-3 border-t border-slate-200/50 dark:border-slate-700/50">
-                  <label class="block text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 ml-1">System Prompt</label>
-                  <textarea v-model="systemPrompt" rows="4" class="w-full px-4 py-3 bg-white/70 dark:bg-slate-800/70 border border-white/50 dark:border-white/10 rounded-2xl focus:ring-2 focus:ring-blue-500/50 outline-none transition resize-none shadow-inner backdrop-blur-md text-sm leading-relaxed font-medium"></textarea>
-                </div>
+                <section class="space-y-3">
+                  <button
+                    v-for="item in suggestedPrompts"
+                    :key="item.title"
+                    type="button"
+                    class="prompt-card"
+                    @click="applyPrompt(item.prompt)"
+                  >
+                    <component :is="item.icon" class="h-5 w-5 text-[var(--accent-strong)]" />
+                    <div class="min-w-0 flex-1 text-left">
+                      <p class="text-sm font-medium">{{ item.title }}</p>
+                      <p class="mt-1 text-xs leading-5 text-[var(--text-muted)]">{{ item.description }}</p>
+                    </div>
+                  </button>
+                </section>
               </div>
             </div>
-          </div>
 
-          <div class="p-6 border-t border-white/20 dark:border-white/5 bg-white/30 dark:bg-slate-900/30 backdrop-blur-xl shrink-0 flex justify-end">
-            <button @click="saveConfig" class="flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-2xl transition font-bold shadow-xl shadow-blue-600/30 backdrop-blur-md border border-blue-400/50 transform hover:-translate-y-0.5">
-              <Check class="w-5 h-5" />
-              保存并应用配置
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
+            <div v-else class="mx-auto flex max-w-5xl flex-col gap-5">
+              <article
+                v-for="(message, index) in messages"
+                :key="`${message.createdAt}-${index}`"
+                class="flex gap-4"
+                :class="message.role === 'user' ? 'justify-end' : 'justify-start'"
+              >
+                <div
+                  v-if="message.role !== 'user'"
+                  class="message-avatar"
+                  :class="message.role === 'assistant' ? 'message-avatar-assistant' : 'message-avatar-system'"
+                >
+                  <Bot v-if="message.role === 'assistant'" class="h-5 w-5" />
+                  <Terminal v-else class="h-5 w-5" />
+                </div>
 
-    <!-- Sidebar -->
-    <aside :class="[
-      'relative z-20 bg-white/40 dark:bg-slate-900/40 backdrop-blur-2xl border-r border-white/20 dark:border-white/5 transition-all duration-300 flex flex-col shadow-[4px_0_24px_-12px_rgba(0,0,0,0.1)]',
-      isSidebarOpen ? 'w-72' : 'w-0 border-r-0 opacity-0'
-    ]">
-      <div class="p-4 flex items-center justify-between border-b border-white/20 dark:border-white/5 h-16 shrink-0 whitespace-nowrap">
-        <span class="font-bold text-lg tracking-tight pl-1 drop-shadow-sm" v-show="isSidebarOpen">会话历史</span>
-        <button @click="createNewSession" class="p-2 hover:bg-white/60 dark:hover:bg-white/10 rounded-xl transition shadow-sm border border-transparent hover:border-white/20" title="新建对话">
-          <Plus class="w-5 h-5" />
-        </button>
-      </div>
-      <div class="flex-1 overflow-y-auto p-3 space-y-1.5 custom-scrollbar">
-        <div v-for="session in sessions" :key="session.id"
-             @click="switchSession(session.id)"
-             :class="[
-               'group flex items-center justify-between p-3 rounded-xl cursor-pointer transition-all duration-200 border',
-               currentSessionId === session.id 
-                 ? 'bg-white/80 dark:bg-slate-800/80 border-white/60 dark:border-white/10 shadow-sm text-blue-700 dark:text-blue-400 font-medium' 
-                 : 'bg-transparent border-transparent hover:bg-white/40 dark:hover:bg-white/5 hover:border-white/20 dark:hover:border-white/5 text-slate-600 dark:text-slate-400'
-             ]">
-          <div class="flex items-center gap-3 overflow-hidden">
-            <div :class="['p-1.5 rounded-lg', currentSessionId === session.id ? 'bg-blue-100 dark:bg-blue-900/50' : 'bg-slate-200/50 dark:bg-slate-800/50']">
-              <MessageSquare class="w-4 h-4 shrink-0" />
+                <div class="flex max-w-[86%] flex-col gap-2 sm:max-w-[74%]" :class="message.role === 'user' ? 'items-end' : 'items-start'">
+                  <div class="message-meta" :class="message.role === 'user' ? 'text-right' : ''">
+                    <span>{{ roleLabel(message.role) }}</span>
+                    <span>·</span>
+                    <span>{{ formatTimestamp(message.createdAt) }}</span>
+                  </div>
+
+                  <div
+                    class="message-bubble"
+                    :class="[
+                      message.role === 'user'
+                        ? 'message-bubble-user'
+                        : message.role === 'system'
+                          ? 'message-bubble-system'
+                          : 'message-bubble-assistant',
+                    ]"
+                  >
+                    <div
+                      v-if="message.role !== 'user'"
+                      class="markdown-body prose prose-sm max-w-none sm:prose-base"
+                      v-html="md.render(message.content)"
+                    ></div>
+                    <div v-else class="whitespace-pre-wrap text-sm leading-7 sm:text-[15px]">{{ message.content }}</div>
+                  </div>
+                </div>
+
+                <div v-if="message.role === 'user'" class="message-avatar message-avatar-user">
+                  <User class="h-5 w-5" />
+                </div>
+              </article>
+
+              <article v-if="isLoading" class="flex gap-4">
+                <div class="message-avatar message-avatar-assistant">
+                  <Bot class="h-5 w-5" />
+                </div>
+                <div class="flex max-w-[86%] flex-col gap-2 sm:max-w-[74%]">
+                  <div class="message-meta">
+                    <span>Kuke Agent</span>
+                    <span>·</span>
+                    <span>处理中</span>
+                  </div>
+                  <div class="message-bubble message-bubble-assistant flex items-center gap-3">
+                    <Loader2 class="h-4 w-4 animate-spin text-[var(--accent-strong)]" />
+                    <span class="text-sm text-[var(--text-muted)]">正在思考或执行工具链…</span>
+                  </div>
+                </div>
+              </article>
             </div>
-            <span class="text-sm truncate">{{ session.title }}</span>
           </div>
-          <button @click="(e) => deleteSession(session.id, e)" class="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/30 rounded-lg transition-all">
-            <Trash2 class="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
-    </aside>
+        </section>
 
-    <!-- Main Content -->
-    <div class="flex-1 flex flex-col h-full relative min-w-0 z-10">
-      <!-- Header -->
-      <header class="h-16 shrink-0 border-b border-white/20 dark:border-white/5 bg-white/30 dark:bg-slate-900/30 backdrop-blur-2xl flex items-center justify-between px-4 sticky top-0 z-10 shadow-sm">
-        <div class="flex items-center gap-3">
-          <button @click="isSidebarOpen = !isSidebarOpen" class="p-2 hover:bg-white/50 dark:hover:bg-white/10 rounded-xl transition border border-transparent hover:border-white/20">
-            <Menu class="w-5 h-5 text-slate-600 dark:text-slate-300" />
-          </button>
-          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center shadow-lg shadow-blue-500/30 border border-white/20">
-            <Bot class="w-5 h-5 drop-shadow-md" />
-          </div>
-          <div class="flex flex-col justify-center">
-            <h1 class="font-bold text-lg leading-none tracking-tight drop-shadow-sm">Kuke Agent</h1>
-            <div class="flex items-center gap-1 mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400 bg-white/40 dark:bg-slate-800/40 px-1.5 py-0.5 rounded-md border border-white/20 dark:border-white/5">
-              <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-              {{ currentProvider.name }} / {{ selectedModel }}
+        <footer class="px-3 pb-3 pt-3 sm:px-4 sm:pb-4 sm:pt-4">
+          <div class="surface-panel p-3 sm:p-4">
+            <div class="mb-3 flex flex-wrap items-center justify-between gap-2 px-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="status-chip">{{ currentProvider.name }}</span>
+                <span class="status-chip">{{ selectedModel }}</span>
+              </div>
+              <p class="text-xs text-[var(--text-subtle)]">Enter 发送，Shift + Enter 换行</p>
             </div>
+
+            <form class="composer-shell" @submit.prevent="sendMessage">
+              <textarea
+                ref="textareaRef"
+                v-model="input"
+                rows="1"
+                class="ui-textarea min-h-[120px] border-0 bg-transparent px-0 py-0 shadow-none focus:ring-0"
+                :placeholder="composerPlaceholder"
+                style="field-sizing: content"
+                @keydown.enter.exact.prevent="sendMessage"
+              ></textarea>
+
+              <div class="mt-4 flex items-center justify-between gap-3">
+                <p class="max-w-2xl text-xs leading-6 text-[var(--text-subtle)]">
+                  Agent 可以调用本地系统能力。执行命令前请确认路径、权限与潜在副作用。
+                </p>
+                <button
+                  type="submit"
+                  class="ui-btn-primary min-w-[108px]"
+                  :disabled="!input.trim() || isLoading"
+                >
+                  <Send class="h-4 w-4" />
+                  发送
+                </button>
+              </div>
+            </form>
+          </div>
+        </footer>
+      </main>
+
+      <transition name="fade-slide">
+        <div v-if="notice" class="notice-wrap">
+          <div class="notice-card" :class="`notice-${notice.type}`">
+            <span class="text-sm font-medium">{{ notice.text }}</span>
           </div>
         </div>
-        <button @click="showSettings = true" class="p-2 hover:bg-white/50 dark:hover:bg-white/10 rounded-xl transition border border-transparent hover:border-white/20 group shadow-sm bg-white/20 dark:bg-slate-800/20" title="设置">
-          <Settings class="w-5 h-5 text-slate-600 dark:text-slate-300 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors" />
-        </button>
-      </header>
-
-      <!-- Chat Messages -->
-      <div ref="chatContainer" class="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 scroll-smooth custom-scrollbar">
-        <div v-if="messages.length === 0" class="h-full flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 opacity-60">
-          <div class="w-20 h-20 bg-white/50 dark:bg-slate-800/50 rounded-3xl flex items-center justify-center shadow-xl shadow-black/5 border border-white/40 dark:border-white/10 backdrop-blur-xl mb-6 transform rotate-3">
-            <Bot class="w-10 h-10 text-slate-400 transform -rotate-3" />
-          </div>
-          <p class="text-sm font-medium tracking-wide">尝试问我："读取当前目录的文件" 或 "帮我安装 tailwind"</p>
-        </div>
-
-        <div v-for="(msg, i) in messages" :key="i" class="flex items-start gap-4 animate-in slide-in-from-bottom-2 duration-300" :class="[msg.role === 'user' ? 'flex-row-reverse' : '']">
-          <!-- Avatar -->
-          <div class="w-10 h-10 rounded-2xl shrink-0 flex items-center justify-center shadow-md border border-white/20 dark:border-white/5 backdrop-blur-md"
-               :class="[
-                 msg.role === 'user' ? 'bg-gradient-to-br from-indigo-100 to-indigo-50 text-indigo-600 dark:from-indigo-900/80 dark:to-indigo-800/50 dark:text-indigo-300' :
-                 msg.role === 'system' ? 'bg-gradient-to-br from-slate-100 to-slate-50 text-slate-500 dark:from-slate-800 dark:to-slate-900' :
-                 'bg-gradient-to-br from-blue-500 to-indigo-600 text-white shadow-blue-500/20'
-               ]">
-            <User v-if="msg.role === 'user'" class="w-5 h-5 drop-shadow-sm" />
-            <Terminal v-else-if="msg.role === 'system'" class="w-5 h-5 drop-shadow-sm" />
-            <Bot v-else class="w-5 h-5 drop-shadow-sm" />
-          </div>
-
-          <!-- Bubble -->
-          <div class="max-w-[85%] md:max-w-[75%] rounded-3xl px-5 py-3.5 shadow-sm relative group backdrop-blur-md border border-white/20 dark:border-white/5"
-               :class="[
-                 msg.role === 'user' 
-                   ? 'bg-blue-600/90 text-white rounded-tr-sm shadow-blue-500/10' 
-                   : msg.role === 'system'
-                     ? 'bg-white/40 dark:bg-slate-800/40 text-sm font-mono text-slate-600 dark:text-slate-300 rounded-tl-sm'
-                     : 'bg-white/80 dark:bg-slate-800/80 rounded-tl-sm shadow-lg shadow-black/5'
-               ]">
-            <!-- Render Markdown -->
-            <div v-if="msg.role !== 'user'" class="prose prose-sm md:prose-base dark:prose-invert max-w-none prose-p:leading-relaxed prose-pre:bg-slate-900/80 prose-pre:backdrop-blur-md prose-pre:border prose-pre:border-white/10" v-html="md.render(msg.content)"></div>
-            <div v-else class="whitespace-pre-wrap leading-relaxed">{{ msg.content }}</div>
-          </div>
-        </div>
-        
-        <!-- Loading State -->
-        <div v-if="isLoading" class="flex items-start gap-4 animate-in fade-in duration-300">
-          <div class="w-10 h-10 rounded-2xl shrink-0 bg-gradient-to-br from-blue-500 to-indigo-600 text-white flex items-center justify-center shadow-md shadow-blue-500/20 border border-white/20 backdrop-blur-md">
-            <Bot class="w-5 h-5 drop-shadow-sm" />
-          </div>
-          <div class="bg-white/80 dark:bg-slate-800/80 border border-white/20 dark:border-white/5 rounded-3xl rounded-tl-sm px-5 py-4 shadow-lg shadow-black/5 backdrop-blur-md flex items-center gap-3">
-            <Loader2 class="w-5 h-5 animate-spin text-blue-600" />
-            <span class="text-sm font-medium text-slate-500 bg-clip-text text-transparent bg-gradient-to-r from-slate-500 to-slate-400 animate-pulse">正在思考或执行操作...</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Input Area -->
-      <div class="p-4 md:p-6 bg-white/30 dark:bg-slate-900/30 border-t border-white/20 dark:border-white/5 backdrop-blur-2xl">
-        <form @submit.prevent="sendMessage" class="relative max-w-4xl mx-auto flex items-end gap-2 bg-white/60 dark:bg-slate-800/60 p-1.5 rounded-3xl border border-white/40 dark:border-white/10 shadow-lg shadow-black/5 backdrop-blur-xl focus-within:ring-4 focus-within:ring-blue-500/20 focus-within:border-blue-500/50 transition-all duration-300">
-          <textarea 
-            v-model="input"
-            @keydown.enter.exact.prevent="sendMessage"
-            rows="1"
-            class="flex-1 max-h-32 min-h-[52px] bg-transparent resize-none py-3.5 px-4 outline-none overflow-y-auto font-medium"
-            placeholder="问我任何事，或让我执行终端命令..."
-            style="field-sizing: content;"
-          ></textarea>
-          <button 
-            type="submit" 
-            :disabled="!input.trim() || isLoading"
-            class="shrink-0 w-12 h-12 rounded-2xl flex items-center justify-center transition-all duration-300 m-0.5"
-            :class="[
-              input.trim() && !isLoading 
-                ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/30 transform hover:-translate-y-0.5' 
-                : 'bg-slate-200/50 dark:bg-slate-700/50 text-slate-400 cursor-not-allowed'
-            ]">
-            <Send class="w-5 h-5 ml-0.5" />
-          </button>
-        </form>
-        <p class="text-center text-xs font-medium text-slate-400 dark:text-slate-500 mt-3 drop-shadow-sm">
-          Shift + Enter 换行，Enter 发送。Agent 能够操作您的本地系统，请谨慎授予高风险指令的权限。
-        </p>
-      </div>
+      </transition>
     </div>
   </div>
 </template>
-
-<style>
-/* Markdown Styles Adjustments */
-.prose pre {
-  margin: 0.5em 0;
-  padding: 0.75em;
-  border-radius: 0.5rem;
-  background-color: #1e293b !important;
-}
-.prose p {
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
-}
-.prose p:first-child {
-  margin-top: 0;
-}
-.prose p:last-child {
-  margin-bottom: 0;
-}
-</style>
