@@ -1,10 +1,51 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { exec } = require('node:child_process');
-const OpenAI = require('openai');
+const OpenAIImport = require('openai');
+
+const OpenAIClient = OpenAIImport?.OpenAI || OpenAIImport;
+const MAX_DEBUG_LOGS = 800;
+const debugLogs = [];
+
+const now = () => Date.now();
+const createTraceId = (scope = 'trace') =>
+  `${scope}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+const safeErrorMessage = (error) =>
+  error instanceof Error ? error.message : String(error || 'unknown error');
+
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function appendDebugLog(scope, event, payload = {}, level = 'info') {
+  const entry = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    ts: new Date().toISOString(),
+    level,
+    scope,
+    event,
+    payload,
+  };
+
+  debugLogs.push(entry);
+  if (debugLogs.length > MAX_DEBUG_LOGS) {
+    debugLogs.splice(0, debugLogs.length - MAX_DEBUG_LOGS);
+  }
+
+  const printable = `[KukeAgent][${entry.level}][${scope}] ${event} ${safeStringify(payload)}`;
+  if (level === 'error') {
+    console.error(printable);
+  } else {
+    console.log(printable);
+  }
+}
 
 function createOpenAIClient(config = {}) {
-  return new OpenAI({
+  return new OpenAIClient({
     apiKey: config.apiKey || 'empty',
     baseURL: config.baseURL,
     dangerouslyAllowBrowser: true,
@@ -19,7 +60,7 @@ function emitChatEvent(handlers, event) {
   try {
     handlers.onEvent(event);
   } catch (error) {
-    console.warn('[KukeAgent] chat stream handler error:', error);
+    appendDebugLog('chat.stream', 'handler_error', { message: safeErrorMessage(error) }, 'error');
   }
 }
 
@@ -27,23 +68,18 @@ function extractContentTextPart(part) {
   if (typeof part === 'string') {
     return part;
   }
-
   if (!part || typeof part !== 'object') {
     return '';
   }
-
   if (typeof part.text === 'string') {
     return part.text;
   }
-
   if (typeof part.text?.value === 'string') {
     return part.text.value;
   }
-
   if (typeof part.content === 'string') {
     return part.content;
   }
-
   return '';
 }
 
@@ -51,18 +87,14 @@ function extractContentText(content) {
   if (typeof content === 'string') {
     return content;
   }
-
   if (Array.isArray(content)) {
     return content.map((part) => extractContentTextPart(part)).join('');
   }
-
   return extractContentTextPart(content);
 }
 
 function normalizeAssistantMessage(message) {
-  const normalizedMessage = {
-    ...message,
-  };
+  const normalizedMessage = { ...message };
   const hasToolCalls = Array.isArray(normalizedMessage.tool_calls) && normalizedMessage.tool_calls.length > 0;
 
   if (hasToolCalls) {
@@ -94,15 +126,12 @@ function mergeToolCallDelta(targetMessage, toolCallDelta) {
   if (toolCallDelta.id) {
     existingToolCall.id = toolCallDelta.id;
   }
-
   if (toolCallDelta.type) {
     existingToolCall.type = toolCallDelta.type;
   }
-
   if (toolCallDelta.function?.name) {
     existingToolCall.function.name += toolCallDelta.function.name;
   }
-
   if (toolCallDelta.function?.arguments) {
     existingToolCall.function.arguments += toolCallDelta.function.arguments;
   }
@@ -110,25 +139,37 @@ function mergeToolCallDelta(targetMessage, toolCallDelta) {
   targetMessage.tool_calls[toolCallIndex] = existingToolCall;
 }
 
-async function createChatResponse(openai, config, messages, tools, handlers = {}) {
+async function createChatResponse(openai, config, messages, tools, handlers = {}, traceId = createTraceId('chat')) {
   const useStream = typeof handlers.onEvent === 'function';
+  appendDebugLog('chat', 'request_start', {
+    traceId,
+    model: config?.model,
+    messageCount: Array.isArray(messages) ? messages.length : 0,
+    toolCount: Array.isArray(tools) ? tools.length : 0,
+    stream: useStream,
+  });
 
   if (!useStream) {
     const response = await openai.chat.completions.create({
       model: config.model,
-      messages: messages,
-      tools: tools,
+      messages,
+      tools,
       tool_choice: tools && tools.length > 0 ? 'auto' : 'none',
       stream: false,
     });
 
+    appendDebugLog('chat', 'request_finish', {
+      traceId,
+      mode: 'non_stream',
+      finishReason: response.choices?.[0]?.finish_reason || null,
+    });
     return normalizeAssistantMessage(response.choices[0].message);
   }
 
   const stream = await openai.chat.completions.create({
     model: config.model,
-    messages: messages,
-    tools: tools,
+    messages,
+    tools,
     tool_choice: tools && tools.length > 0 ? 'auto' : 'none',
     stream: true,
   });
@@ -138,6 +179,10 @@ async function createChatResponse(openai, config, messages, tools, handlers = {}
     content: '',
     tool_calls: [],
   };
+
+  let contentDeltaCount = 0;
+  let toolDeltaCount = 0;
+  let finishReason = null;
 
   for await (const chunk of stream) {
     const choice = chunk.choices?.[0];
@@ -149,6 +194,7 @@ async function createChatResponse(openai, config, messages, tools, handlers = {}
 
     const deltaText = extractContentText(delta.content);
     if (deltaText) {
+      contentDeltaCount += 1;
       finalMessage.content += deltaText;
       emitChatEvent(handlers, { type: 'content_delta', delta: deltaText });
     }
@@ -156,6 +202,7 @@ async function createChatResponse(openai, config, messages, tools, handlers = {}
     if (Array.isArray(delta.tool_calls)) {
       for (const toolCallDelta of delta.tool_calls) {
         mergeToolCallDelta(finalMessage, toolCallDelta);
+        toolDeltaCount += 1;
       }
 
       emitChatEvent(handlers, {
@@ -165,7 +212,8 @@ async function createChatResponse(openai, config, messages, tools, handlers = {}
     }
 
     if (choice?.finish_reason) {
-      emitChatEvent(handlers, { type: 'finish', finishReason: choice.finish_reason });
+      finishReason = choice.finish_reason;
+      emitChatEvent(handlers, { type: 'finish', finishReason });
     }
   }
 
@@ -173,85 +221,207 @@ async function createChatResponse(openai, config, messages, tools, handlers = {}
     finalMessage.content = null;
   }
 
+  appendDebugLog('chat', 'request_finish', {
+    traceId,
+    mode: 'stream',
+    contentDeltaCount,
+    toolDeltaCount,
+    finalToolCalls: finalMessage.tool_calls.length,
+    finishReason,
+  });
+
   return normalizeAssistantMessage(finalMessage);
 }
 
 window.localTools = {
-  // AI 聊天请求 (在 Node 端执行，避免跨域问题)
   chat: async (config, messages, tools, handlers) => {
+    const traceId = createTraceId('chat');
+    const startAt = now();
     try {
       const openai = createOpenAIClient(config);
-      const response = await createChatResponse(openai, config, messages, tools, handlers);
+      const response = await createChatResponse(openai, config, messages, tools, handlers, traceId);
+      appendDebugLog('chat', 'success', { traceId, durationMs: now() - startAt });
       return { success: true, data: response };
-    } catch (e) {
-      return { success: false, error: e.message };
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      appendDebugLog('chat', 'error', { traceId, durationMs: now() - startAt, message }, 'error');
+      return { success: false, error: message };
     }
   },
 
-  // 获取可用模型列表
   getModels: async (config) => {
+    const traceId = createTraceId('models');
+    const startAt = now();
     try {
       const openai = createOpenAIClient(config);
       const response = await openai.models.list();
+      appendDebugLog('models', 'success', {
+        traceId,
+        durationMs: now() - startAt,
+        total: Array.isArray(response?.data) ? response.data.length : 0,
+      });
       return { success: true, data: response.data };
-    } catch (e) {
-      return { success: false, error: e.message };
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      appendDebugLog('models', 'error', { traceId, durationMs: now() - startAt, message }, 'error');
+      return { success: false, error: message };
     }
   },
 
-  // 读取目录
   readDir: (dirPath) => {
+    const traceId = createTraceId('read_dir');
+    const startAt = now();
+    const targetPath = path.resolve(String(dirPath || ''));
     try {
-      const targetPath = path.resolve(dirPath);
       const files = fs.readdirSync(targetPath, { withFileTypes: true });
-      return {
-        success: true,
-        data: files.map(f => ({
-          name: f.name,
-          isDirectory: f.isDirectory(),
-          path: path.join(targetPath, f.name)
-        }))
-      };
-    } catch (e) {
-      return { success: false, error: e.message };
-    }
-  },
-  
-  // 读取文件内容
-  readFile: (filePath) => {
-    try {
-      const data = fs.readFileSync(path.resolve(filePath), 'utf-8');
+      const data = files.map((file) => ({
+        name: file.name,
+        isDirectory: file.isDirectory(),
+        path: path.join(targetPath, file.name),
+      }));
+      appendDebugLog('file.read_dir', 'success', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: dirPath,
+        resolvedPath: targetPath,
+        items: data.length,
+      });
       return { success: true, data };
-    } catch (e) {
-      return { success: false, error: e.message };
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      appendDebugLog('file.read_dir', 'error', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: dirPath,
+        resolvedPath: targetPath,
+        message,
+      }, 'error');
+      return { success: false, error: message };
     }
   },
 
-  // 写入文件
-  writeFile: (filePath, content) => {
+  readFile: (filePath) => {
+    const traceId = createTraceId('read_file');
+    const startAt = now();
+    const targetPath = path.resolve(String(filePath || ''));
     try {
-      const targetPath = path.resolve(filePath);
+      const data = fs.readFileSync(targetPath, 'utf-8');
+      appendDebugLog('file.read_file', 'success', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: filePath,
+        resolvedPath: targetPath,
+        bytes: Buffer.byteLength(data, 'utf-8'),
+      });
+      return { success: true, data };
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      appendDebugLog('file.read_file', 'error', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: filePath,
+        resolvedPath: targetPath,
+        message,
+      }, 'error');
+      return { success: false, error: message };
+    }
+  },
+
+  writeFile: (filePath, content) => {
+    const traceId = createTraceId('write_file');
+    const startAt = now();
+    const targetPath = path.resolve(String(filePath || ''));
+    try {
       const dir = path.dirname(targetPath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(targetPath, content, 'utf-8');
+      const normalizedContent = typeof content === 'string' ? content : String(content ?? '');
+      fs.writeFileSync(targetPath, normalizedContent, 'utf-8');
+      appendDebugLog('file.write_file', 'success', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: filePath,
+        resolvedPath: targetPath,
+        bytes: Buffer.byteLength(normalizedContent, 'utf-8'),
+      });
       return { success: true };
-    } catch (e) {
-      return { success: false, error: e.message };
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      appendDebugLog('file.write_file', 'error', {
+        traceId,
+        durationMs: now() - startAt,
+        inputPath: filePath,
+        resolvedPath: targetPath,
+        message,
+      }, 'error');
+      return { success: false, error: message };
     }
   },
 
-  // 执行终端指令
   execCommand: (command, cwd) => {
-    return new Promise((resolve) => {
-      exec(command, { cwd: cwd || process.cwd() }, (error, stdout, stderr) => {
-        if (error) {
-          resolve({ success: false, error: error.message, stderr });
-        } else {
-          resolve({ success: true, stdout, stderr });
-        }
-      });
+    const traceId = createTraceId('exec');
+    const startAt = now();
+    const resolvedCwd = cwd ? path.resolve(String(cwd)) : process.cwd();
+
+    appendDebugLog('exec', 'start', {
+      traceId,
+      command,
+      cwd: resolvedCwd,
     });
-  }
+
+    return new Promise((resolve) => {
+      exec(
+        String(command || ''),
+        {
+          cwd: resolvedCwd,
+          windowsHide: true,
+          shell: true,
+          timeout: 5 * 60 * 1000,
+          maxBuffer: 8 * 1024 * 1024,
+          encoding: 'utf8',
+        },
+        (error, stdout, stderr) => {
+          const durationMs = now() - startAt;
+          if (error) {
+            appendDebugLog('exec', 'error', {
+              traceId,
+              durationMs,
+              command,
+              cwd: resolvedCwd,
+              message: safeErrorMessage(error),
+              stderrLength: stderr?.length || 0,
+              stdoutLength: stdout?.length || 0,
+            }, 'error');
+            resolve({ success: false, error: error.message, stderr, stdout });
+            return;
+          }
+
+          appendDebugLog('exec', 'success', {
+            traceId,
+            durationMs,
+            command,
+            cwd: resolvedCwd,
+            stdoutLength: stdout?.length || 0,
+            stderrLength: stderr?.length || 0,
+          });
+          resolve({ success: true, stdout, stderr });
+        },
+      );
+    });
+  },
+
+  getDebugLogs: (limit = 300) => {
+    const normalizedLimit = Math.min(Math.max(Number(limit) || 100, 1), MAX_DEBUG_LOGS);
+    return {
+      success: true,
+      data: debugLogs.slice(-normalizedLimit),
+    };
+  },
+
+  clearDebugLogs: () => {
+    debugLogs.splice(0, debugLogs.length);
+    appendDebugLog('debug', 'cleared', {}, 'info');
+    return { success: true };
+  },
 };

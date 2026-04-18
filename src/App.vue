@@ -2,6 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Bot,
+  Bug,
+  ChevronDown,
   Check,
   Plus,
   RefreshCw,
@@ -10,6 +12,7 @@ import {
   Terminal,
   Trash2,
   User,
+  Wrench,
   X,
   PanelLeftClose,
   PanelLeftOpen,
@@ -24,10 +27,25 @@ const md = new MarkdownIt({
 
 type MessageRole = 'assistant' | 'user' | 'system'
 
+type ToolInvocationStatus = 'draft' | 'pending' | 'running' | 'success' | 'error'
+
+interface ToolInvocation {
+  id: string
+  callId: string
+  name: string
+  argumentsText: string
+  resultText: string
+  status: ToolInvocationStatus
+  expanded: boolean
+}
+
 interface ChatMessage {
+  id: string
   role: MessageRole
   content: string
   createdAt: number
+  isStreaming?: boolean
+  toolInvocations: ToolInvocation[]
 }
 
 interface Provider {
@@ -45,10 +63,55 @@ interface ChatSession {
   updatedAt: number
 }
 
-const createMessage = (role: MessageRole, content: string): ChatMessage => ({
+interface DebugLogEntry {
+  id: string
+  ts: string
+  level: 'info' | 'error'
+  scope: string
+  event: string
+  payload: Record<string, unknown>
+}
+
+const createMessageId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+
+const normalizeToolInvocations = (value: unknown): ToolInvocation[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .filter(Boolean)
+    .map((tool, index) => {
+      const current = tool as Partial<ToolInvocation>
+      const normalizedStatus = String(current.status ?? 'pending')
+      const allowedStatus: ToolInvocationStatus[] = ['draft', 'pending', 'running', 'success', 'error']
+
+      return {
+        id: String(current.id ?? `tool_${index}`),
+        callId: String(current.callId ?? current.id ?? `tool_${index}`),
+        name: String(current.name ?? ''),
+        argumentsText: String(current.argumentsText ?? ''),
+        resultText: String(current.resultText ?? ''),
+        status: allowedStatus.includes(normalizedStatus as ToolInvocationStatus)
+          ? (normalizedStatus as ToolInvocationStatus)
+          : 'pending',
+        expanded: Boolean(current.expanded),
+      }
+    })
+}
+
+const createMessage = (
+  role: MessageRole,
+  content: string,
+  options: Partial<Omit<ChatMessage, 'id' | 'role' | 'content' | 'createdAt'>> = {},
+): ChatMessage => ({
+  id: createMessageId(),
   role,
   content,
   createdAt: Date.now(),
+  isStreaming: false,
+  toolInvocations: [],
+  ...options,
 })
 
 const normalizeMessages = (value: unknown): ChatMessage[] => {
@@ -61,9 +124,12 @@ const normalizeMessages = (value: unknown): ChatMessage[] => {
     .map((message, index) => {
       const current = message as Partial<ChatMessage>
       return {
+        id: String(current.id ?? `message_${Date.now()}_${index}`),
         role: (current.role ?? 'system') as MessageRole,
         content: String(current.content ?? ''),
         createdAt: Number(current.createdAt ?? Date.now() + index),
+        isStreaming: false,
+        toolInvocations: normalizeToolInvocations(current.toolInvocations),
       }
     })
 }
@@ -120,6 +186,8 @@ const systemPrompt = ref(
 )
 const sessions = ref<ChatSession[]>([])
 const currentSessionId = ref('')
+const debugLogs = ref<DebugLogEntry[]>([])
+const isLoadingDebugLogs = ref(false)
 
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -132,6 +200,7 @@ const activeSession = computed(
 const hasMessages = computed(() => messages.value.length > 0)
 const headerTitle = computed(() => (!isSidebarOpen.value && activeSession.value ? activeSession.value.title : 'Kuke Agent'))
 const headerTitleKey = computed(() => (!isSidebarOpen.value && activeSession.value ? activeSession.value.id : 'brand'))
+const debugLogItems = computed(() => [...debugLogs.value].reverse())
 
 const tools = [
   {
@@ -249,6 +318,259 @@ const scrollToBottom = () => {
       chatContainer.value.scrollTop = chatContainer.value.scrollHeight
     }
   })
+}
+
+const renderMarkdown = (content: string) => md.render(content)
+
+const hasRenderableContent = (content: string) => Boolean(content.trim())
+
+const getToolArgumentsPlaceholder = (tool: ToolInvocation) =>
+  tool.status === 'draft' ? '参数正在生成中…' : '当前没有可展示的工具参数。'
+
+const getToolResultPlaceholder = (tool: ToolInvocation) =>
+  ({
+    draft: '等待模型补全工具调用…',
+    pending: '等待触发工具执行…',
+    running: '正在等待本地工具返回结果…',
+    success: '工具已完成，但当前没有结构化结果。',
+    error: '工具执行失败，但当前没有错误详情。',
+  })[tool.status]
+
+const tryParseJson = (value: string) => {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+const loadDebugLogs = async () => {
+  const getter = (window as any).localTools?.getDebugLogs
+  if (typeof getter !== 'function') {
+    return
+  }
+
+  isLoadingDebugLogs.value = true
+  try {
+    const response = await getter(200)
+    if (response?.success && Array.isArray(response.data)) {
+      debugLogs.value = response.data as DebugLogEntry[]
+    }
+  } finally {
+    isLoadingDebugLogs.value = false
+  }
+}
+
+const clearDebugLogs = async () => {
+  const cleaner = (window as any).localTools?.clearDebugLogs
+  if (typeof cleaner !== 'function') {
+    return
+  }
+
+  await cleaner()
+  await loadDebugLogs()
+  showNotice('调试日志已清空。', 'success')
+}
+
+const executeLocalTool = async (functionName: string, parsedArguments: Record<string, unknown>, availableTool: any) => {
+  if (typeof availableTool !== 'function') {
+    return {
+      success: false,
+      error: '当前环境未提供此本地工具。',
+    }
+  }
+
+  switch (functionName) {
+    case 'readDir':
+      return await availableTool(String(parsedArguments.dirPath ?? ''))
+    case 'readFile':
+      return await availableTool(String(parsedArguments.filePath ?? ''))
+    case 'writeFile':
+      return await availableTool(
+        String(parsedArguments.filePath ?? ''),
+        String(parsedArguments.content ?? ''),
+      )
+    case 'execCommand':
+      return await availableTool(
+        String(parsedArguments.command ?? ''),
+        parsedArguments.cwd ? String(parsedArguments.cwd) : undefined,
+      )
+    default:
+      return await availableTool(parsedArguments)
+  }
+}
+
+const stringifyForBlock = (value: unknown) => {
+  if (typeof value === 'string') {
+    const parsed = tryParseJson(value)
+    if (parsed !== null) {
+      return JSON.stringify(parsed, null, 2)
+    }
+    return value
+  }
+
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value ?? '')
+  }
+}
+
+const isToolResultError = (value: unknown) =>
+  typeof value === 'object' && value !== null && 'success' in value && (value as { success?: boolean }).success === false
+
+const getMessageRoleLabel = (role: MessageRole) =>
+  ({
+    assistant: '助手',
+    user: '你',
+    system: '系统',
+  })[role]
+
+const getToolStatusLabel = (status: ToolInvocationStatus) =>
+  ({
+    draft: '生成参数',
+    pending: '待执行',
+    running: '执行中',
+    success: '已完成',
+    error: '失败',
+  })[status]
+
+const getToolSummaryText = (message: ChatMessage) => {
+  const total = message.toolInvocations.length
+  if (!total) {
+    return ''
+  }
+
+  const runningCount = message.toolInvocations.filter((tool) => tool.status === 'running').length
+  const finishedCount = message.toolInvocations.filter((tool) => ['success', 'error'].includes(tool.status)).length
+
+  if (runningCount > 0) {
+    return `${total} 个工具，${runningCount} 个执行中`
+  }
+
+  if (finishedCount === total) {
+    return `${total} 个工具已返回`
+  }
+
+  return `${total} 个工具待执行`
+}
+
+const updateMessageById = (messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
+  const targetIndex = messages.value.findIndex((message) => message.id === messageId)
+  if (targetIndex === -1) {
+    return
+  }
+
+  messages.value[targetIndex] = updater(messages.value[targetIndex])
+}
+
+const removeMessageById = (messageId: string) => {
+  messages.value = messages.value.filter((message) => message.id !== messageId)
+}
+
+const appendMessageContent = (
+  messageId: string,
+  delta: string,
+  options: {
+    separate?: boolean
+  } = {},
+) => {
+  updateMessageById(messageId, (message) => {
+    const shouldInsertSpacer =
+      Boolean(options.separate) &&
+      Boolean(delta) &&
+      Boolean(message.content.trim()) &&
+      !message.content.endsWith('\n\n')
+
+    return {
+      ...message,
+      content: `${message.content}${shouldInsertSpacer ? '\n\n' : ''}${delta}`,
+    }
+  })
+}
+
+const resolveToolInvocationLookupKey = (tool: Partial<ToolInvocation>, index?: number) =>
+  String(tool.callId ?? tool.id ?? `tool_${index ?? 0}`)
+
+const syncToolCallsToMessage = (messageId: string, toolCalls: unknown) => {
+  if (!Array.isArray(toolCalls)) {
+    return
+  }
+
+  updateMessageById(messageId, (message) => {
+    const previousTools = message.toolInvocations ?? []
+    const previousToolMap = new Map(previousTools.map((tool, index) => [resolveToolInvocationLookupKey(tool, index), tool]))
+
+    const nextTools = toolCalls.map((toolCall, index) => {
+      const rawCallId = String((toolCall as any)?.id ?? '').trim()
+      const toolLookupKey = rawCallId || `tool_${index}`
+      const currentArguments = String((toolCall as any)?.function?.arguments ?? '')
+      const existingTool = previousToolMap.get(toolLookupKey) ?? previousTools[index]
+      const hasStableArguments = Boolean(currentArguments.trim())
+      const nextStatus =
+        existingTool?.status && !['draft', 'pending'].includes(existingTool.status)
+          ? existingTool.status
+          : hasStableArguments
+            ? 'pending'
+            : 'draft'
+
+      return {
+        id: existingTool?.id ?? toolLookupKey,
+        callId: rawCallId || existingTool?.callId || toolLookupKey,
+        name: String((toolCall as any)?.function?.name ?? existingTool?.name ?? ''),
+        argumentsText: hasStableArguments
+          ? stringifyForBlock(currentArguments)
+          : (existingTool?.argumentsText ?? ''),
+        resultText: existingTool?.resultText ?? '',
+        status: nextStatus,
+        expanded: existingTool?.expanded ?? index === toolCalls.length - 1,
+      } satisfies ToolInvocation
+    })
+
+    const nextToolKeys = new Set(nextTools.map((tool, index) => resolveToolInvocationLookupKey(tool, index)))
+    const preservedTools = previousTools.filter((tool, index) => {
+      const key = resolveToolInvocationLookupKey(tool, index)
+      return !nextToolKeys.has(key) && ['running', 'success', 'error'].includes(tool.status)
+    })
+
+    return {
+      ...message,
+      toolInvocations: [...nextTools, ...preservedTools],
+    }
+  })
+}
+
+const updateToolInvocation = (
+  messageId: string,
+  matcher: { toolId?: string; index?: number },
+  updater: (tool: ToolInvocation) => ToolInvocation,
+) => {
+  updateMessageById(messageId, (message) => {
+    const toolInvocations = [...(message.toolInvocations ?? [])]
+    const toolIndex = matcher.toolId
+      ? toolInvocations.findIndex((tool) => tool.id === matcher.toolId || tool.callId === matcher.toolId)
+      : (matcher.index ?? -1)
+    const currentTool = toolInvocations[toolIndex]
+
+    if (!currentTool) {
+      return message
+    }
+
+    toolInvocations[toolIndex] = updater(currentTool)
+    return {
+      ...message,
+      toolInvocations,
+    }
+  })
+}
+
+const setToolExpanded = (messageId: string, toolId: string, expanded: boolean) => {
+  updateMessageById(messageId, (message) => ({
+    ...message,
+    toolInvocations: message.toolInvocations.map((tool) =>
+      tool.id === toolId ? { ...tool, expanded } : tool,
+    ),
+  }))
 }
 
 const formatSessionTime = (value: number) => {
@@ -462,26 +784,50 @@ const sendMessage = async () => {
 
   messages.value.push(createMessage('user', content))
   input.value = ''
+
+  const apiMessages: any[] = [
+    { role: 'system', content: systemPrompt.value },
+    ...messages.value
+      .filter((message) => message.role !== 'system')
+      .map(({ role, content: messageContent }) => ({ role, content: messageContent })),
+  ]
+
+  const assistantMessage = createMessage('assistant', '', {
+    isStreaming: true,
+    toolInvocations: [],
+  })
+  messages.value.push(assistantMessage)
+  const assistantMessageId = assistantMessage.id
   isLoading.value = true
   updateCurrentSession()
   scrollToBottom()
 
   try {
-    const apiMessages: any[] = [
-      { role: 'system', content: systemPrompt.value },
-      ...messages.value
-        .filter((message) => message.role !== 'system')
-        .map(({ role, content: messageContent }) => ({ role, content: messageContent })),
-    ]
+    const chatConfig = {
+      apiKey: currentProvider.value.apiKey,
+      baseURL: currentProvider.value.baseURL,
+      model: selectedModel.value,
+    }
+    let firstResponseStreamed = false
 
     const response = await chat(
-      {
-        apiKey: currentProvider.value.apiKey,
-        baseURL: currentProvider.value.baseURL,
-        model: selectedModel.value,
-      },
+      chatConfig,
       apiMessages,
       tools,
+      {
+        onEvent: (event: any) => {
+          if (event.type === 'content_delta' && event.delta) {
+            firstResponseStreamed = true
+            appendMessageContent(assistantMessageId, String(event.delta))
+          }
+
+          if (event.type === 'tool_calls_delta' && Array.isArray(event.toolCalls)) {
+            syncToolCallsToMessage(assistantMessageId, event.toolCalls)
+          }
+
+          scrollToBottom()
+        },
+      },
     )
 
     if (!response.success) {
@@ -490,74 +836,122 @@ const sendMessage = async () => {
 
     const message = response.data
 
+    if (!firstResponseStreamed && typeof message.content === 'string' && message.content) {
+      updateMessageById(assistantMessageId, (current) => ({
+        ...current,
+        content: message.content,
+      }))
+    }
+
     if (message.tool_calls?.length) {
+      syncToolCallsToMessage(assistantMessageId, message.tool_calls)
       apiMessages.push(message)
 
-      for (const toolCall of message.tool_calls) {
+      for (const [toolIndex, toolCall] of message.tool_calls.entries()) {
         const functionName = toolCall.function.name
-        const args = JSON.parse(toolCall.function.arguments || '{}')
+        const rawArguments = toolCall.function.arguments || '{}'
         const availableTool = (window as any).localTools?.[functionName]
+        const parsedArguments = tryParseJson(rawArguments)
+        const toolCallId = String(toolCall.id ?? `tool_${toolIndex}`)
 
-        messages.value.push(
-          createMessage(
-            'system',
-            `工具调用：**${functionName}**\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``,
-          ),
-        )
+        updateToolInvocation(assistantMessageId, { toolId: toolCallId, index: toolIndex }, (tool) => ({
+          ...tool,
+          callId: toolCallId,
+          name: functionName,
+          argumentsText: stringifyForBlock(rawArguments),
+          resultText: '正在等待本地工具返回结果…',
+          status: 'running',
+          expanded: true,
+        }))
         scrollToBottom()
 
-        let toolResult = ''
+        let toolResult: unknown = null
 
-        if (typeof availableTool === 'function') {
-          if (functionName === 'execCommand') {
-            const result = await availableTool(args.command, args.cwd)
-            toolResult = JSON.stringify(result)
-          } else {
-            const result = await availableTool(...Object.values(args))
-            toolResult = JSON.stringify(result)
+        if (parsedArguments === null || typeof parsedArguments !== 'object') {
+          toolResult = {
+            success: false,
+            error: '工具参数解析失败',
+            rawArguments,
           }
+        } else if (typeof availableTool === 'function') {
+          toolResult = await executeLocalTool(functionName, parsedArguments as Record<string, unknown>, availableTool)
         } else {
-          toolResult = '错误：当前环境未提供此本地工具。'
+          toolResult = {
+            success: false,
+            error: '当前环境未提供此本地工具。',
+          }
         }
+
+        const toolResultText = stringifyForBlock(toolResult)
+        const toolStatus: ToolInvocationStatus = isToolResultError(toolResult) ? 'error' : 'success'
 
         apiMessages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
           name: functionName,
-          content: toolResult,
+          content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
         })
 
-        messages.value.push(
-          createMessage(
-            'system',
-            `工具结果：\n\n\`\`\`json\n${toolResult.substring(0, 1000)}${toolResult.length > 1000 ? '...' : ''}\n\`\`\``,
-          ),
-        )
+        updateToolInvocation(assistantMessageId, { toolId: toolCallId, index: toolIndex }, (tool) => ({
+          ...tool,
+          resultText: toolResultText,
+          status: toolStatus,
+          expanded: toolStatus === 'error',
+        }))
+        await loadDebugLogs()
         scrollToBottom()
       }
 
+      let secondResponseStreamed = false
       const secondResponse = await chat(
-        {
-          apiKey: currentProvider.value.apiKey,
-          baseURL: currentProvider.value.baseURL,
-          model: selectedModel.value,
-        },
+        chatConfig,
         apiMessages,
         null,
+        {
+          onEvent: (event: any) => {
+            if (event.type === 'content_delta' && event.delta) {
+              appendMessageContent(assistantMessageId, String(event.delta), { separate: !secondResponseStreamed })
+              secondResponseStreamed = true
+              scrollToBottom()
+            }
+          },
+        },
       )
 
       if (!secondResponse.success) {
         throw new Error(secondResponse.error || '工具调用后续响应失败')
       }
 
-      messages.value.push(createMessage('assistant', secondResponse.data.content || ''))
-    } else {
-      messages.value.push(createMessage('assistant', message.content || ''))
+      if (!secondResponseStreamed && secondResponse.data.content) {
+        appendMessageContent(assistantMessageId, secondResponse.data.content, { separate: true })
+      }
     }
 
+    updateMessageById(assistantMessageId, (current) => ({
+      ...current,
+      isStreaming: false,
+      content: current.content.trim() || current.toolInvocations.length > 0
+        ? current.content
+        : '已完成请求，但模型未返回可展示文本。',
+    }))
     updateCurrentSession()
   } catch (error) {
     const message = error instanceof Error ? error.message : '请求失败'
+    const currentAssistantMessage = messages.value.find((item) => item.id === assistantMessageId)
+
+    if (
+      currentAssistantMessage &&
+      !currentAssistantMessage.content.trim() &&
+      !currentAssistantMessage.toolInvocations.length
+    ) {
+      removeMessageById(assistantMessageId)
+    } else {
+      updateMessageById(assistantMessageId, (current) => ({
+        ...current,
+        isStreaming: false,
+      }))
+    }
+
     messages.value.push(createMessage('system', `请求失败：${message}`))
     showNotice(message, 'error')
   } finally {
@@ -569,6 +963,7 @@ const sendMessage = async () => {
 onMounted(() => {
   ensureProviderSelection()
   loadSessionsFromStorage()
+  loadDebugLogs()
   environmentReady.value = Boolean((window as any).localTools?.chat)
 
   if (!environmentReady.value) {
@@ -715,8 +1110,8 @@ onBeforeUnmount(() => {
               <div v-else class="flex flex-col gap-8 pb-4">
                 <TransitionGroup name="message-stack" tag="div" class="flex flex-col gap-8">
                   <article
-                    v-for="(message, index) in messages"
-                    :key="`${message.createdAt}-${message.role}-${index}`"
+                    v-for="message in messages"
+                    :key="message.id"
                     class="message-row group flex gap-4"
                     :class="message.role === 'user' ? 'flex-row-reverse' : 'flex-row'"
                   >
@@ -734,7 +1129,25 @@ onBeforeUnmount(() => {
                     </div>
 
                     <!-- Content -->
-                    <div class="flex max-w-[85%] flex-col gap-1 sm:max-w-[80%]" :class="message.role === 'user' ? 'items-end' : 'items-start'">
+                    <div class="flex max-w-[85%] flex-col gap-2 sm:max-w-[80%]" :class="message.role === 'user' ? 'items-end' : 'items-start'">
+                      <div
+                        v-if="message.role === 'system' || (message.role === 'assistant' && message.toolInvocations.length)"
+                        class="message-meta-row"
+                      >
+                        <span
+                          v-if="message.role === 'system'"
+                          class="message-role-label"
+                          :class="`message-role-label-${message.role}`"
+                        >
+                          {{ getMessageRoleLabel(message.role) }}
+                        </span>
+                        <span
+                          v-if="message.role === 'assistant' && message.toolInvocations.length"
+                          class="assistant-inline-chip"
+                        >
+                          {{ getToolSummaryText(message) }}
+                        </span>
+                      </div>
                       <div
                         class="message-bubble-shell text-[15px] leading-relaxed"
                         :class="[
@@ -745,10 +1158,73 @@ onBeforeUnmount(() => {
                               : 'py-1 text-zinc-800'
                         ]"
                       >
+                        <template v-if="message.role === 'assistant'">
+                          <div
+                            v-if="hasRenderableContent(message.content)"
+                            class="assistant-rich-message markdown-body prose prose-sm prose-zinc max-w-none"
+                            v-html="renderMarkdown(message.content)"
+                          ></div>
+
+                          <div v-if="message.toolInvocations.length" class="tool-embed-list">
+                            <section
+                              v-for="tool in message.toolInvocations"
+                              :key="tool.id"
+                              class="tool-embed-card"
+                              :class="`tool-embed-card-${tool.status}`"
+                            >
+                              <button
+                                type="button"
+                                class="tool-embed-summary"
+                                @click="setToolExpanded(message.id, tool.id, !tool.expanded)"
+                              >
+                                <div class="tool-embed-summary-main">
+                                  <div class="tool-embed-icon">
+                                    <Wrench class="h-4 w-4" />
+                                  </div>
+                                  <div class="tool-embed-title-wrap">
+                                    <span class="tool-embed-caption">工具调用</span>
+                                    <span class="tool-embed-name">{{ tool.name || '等待工具名称' }}</span>
+                                  </div>
+                                </div>
+
+                                <div class="tool-embed-summary-side">
+                                  <span class="tool-status-chip" :class="`tool-status-chip-${tool.status}`">
+                                    {{ getToolStatusLabel(tool.status) }}
+                                  </span>
+                                  <ChevronDown class="tool-embed-chevron" :class="{ 'is-open': tool.expanded }" />
+                                </div>
+                              </button>
+
+                              <Transition name="tool-details">
+                                <div v-if="tool.expanded" class="tool-embed-body">
+                                  <div class="tool-embed-grid">
+                                    <section class="tool-embed-panel">
+                                      <header class="tool-embed-panel-header">参数</header>
+                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ tool.argumentsText || getToolArgumentsPlaceholder(tool) }}</code></pre>
+                                    </section>
+                                    <section class="tool-embed-panel">
+                                      <header class="tool-embed-panel-header">结果</header>
+                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ tool.resultText || getToolResultPlaceholder(tool) }}</code></pre>
+                                    </section>
+                                  </div>
+                                </div>
+                              </Transition>
+                            </section>
+                          </div>
+
+                          <div
+                            v-if="message.isStreaming && !hasRenderableContent(message.content) && !message.toolInvocations.length"
+                            class="assistant-stream-placeholder"
+                          >
+                            <span class="loading-dot"></span>
+                            <span class="loading-dot" style="animation-delay: 0.12s"></span>
+                            <span class="loading-dot" style="animation-delay: 0.24s"></span>
+                          </div>
+                        </template>
                         <div
-                          v-if="message.role !== 'user'"
+                          v-else-if="message.role === 'system'"
                           class="markdown-body prose prose-sm prose-zinc max-w-none"
-                          v-html="md.render(message.content)"
+                          v-html="renderMarkdown(message.content)"
                         ></div>
                         <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
                       </div>
@@ -756,18 +1232,6 @@ onBeforeUnmount(() => {
                   </article>
                 </TransitionGroup>
 
-                <Transition name="message-appear">
-                  <article v-if="isLoading" class="loading-row flex gap-4">
-                    <div class="message-avatar-shell mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-zinc-900 text-zinc-50 shadow-sm">
-                      <Bot class="h-4 w-4" />
-                    </div>
-                    <div class="flex items-center gap-2 py-2.5 text-zinc-800">
-                      <span class="loading-dot"></span>
-                      <span class="loading-dot" style="animation-delay: 0.14s"></span>
-                      <span class="loading-dot" style="animation-delay: 0.28s"></span>
-                    </div>
-                  </article>
-                </Transition>
               </div>
             </div>
           </Transition>
@@ -850,6 +1314,16 @@ onBeforeUnmount(() => {
             >
               模型供应商
             </button>
+            <button
+              class="motion-list-item w-full rounded-lg px-3 py-2 text-left text-sm font-medium"
+              :class="activeSettingsTab === 'debug' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              @click="activeSettingsTab = 'debug'; loadDebugLogs()"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Bug class="h-4 w-4" />
+                调试日志
+              </span>
+            </button>
           </div>
 
           <!-- Settings Content -->
@@ -866,7 +1340,7 @@ onBeforeUnmount(() => {
               </div>
 
               <!-- Providers Tab -->
-              <div v-else key="providers" class="flex flex-1 overflow-hidden">
+              <div v-else-if="activeSettingsTab === 'providers'" key="providers" class="flex flex-1 overflow-hidden">
                 <!-- Providers List -->
                 <div class="flex w-[220px] flex-col border-r border-zinc-100 bg-zinc-50/50">
                   <div class="flex items-center justify-between border-b border-zinc-100 p-3">
@@ -944,6 +1418,48 @@ onBeforeUnmount(() => {
                         </button>
                       </div>
                     </div>
+                  </div>
+                </div>
+              </div>
+              <div v-else key="debug" class="flex h-full flex-col p-6">
+                <div class="mb-4 flex items-center justify-between">
+                  <h4 class="text-sm font-semibold text-zinc-800">结构化调试日志</h4>
+                  <div class="flex items-center gap-2">
+                    <button
+                      type="button"
+                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-3 text-xs text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                      @click="loadDebugLogs"
+                    >
+                      <RefreshCw class="h-3.5 w-3.5" :class="{ 'spin-gentle': isLoadingDebugLogs }" />
+                      刷新
+                    </button>
+                    <button
+                      type="button"
+                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-3 text-xs text-zinc-600 hover:bg-red-50 hover:text-red-600"
+                      @click="clearDebugLogs"
+                    >
+                      <Trash2 class="h-3.5 w-3.5" />
+                      清空
+                    </button>
+                  </div>
+                </div>
+                <div class="debug-log-list custom-scrollbar flex-1 space-y-2 overflow-y-auto rounded-xl border border-zinc-200 bg-zinc-50/60 p-3">
+                  <article
+                    v-for="item in debugLogItems"
+                    :key="item.id"
+                    class="debug-log-item rounded-lg border border-zinc-200 bg-white p-3"
+                  >
+                    <div class="mb-1.5 flex items-center gap-2">
+                      <span class="tool-status-chip" :class="item.level === 'error' ? 'tool-status-chip-error' : 'tool-status-chip-success'">
+                        {{ item.level }}
+                      </span>
+                      <span class="text-[11px] text-zinc-500">{{ item.ts }}</span>
+                    </div>
+                    <div class="text-xs font-medium text-zinc-700">{{ item.scope }} / {{ item.event }}</div>
+                    <pre class="tool-embed-code mt-2 max-h-[160px] rounded-lg"><code>{{ stringifyForBlock(item.payload) }}</code></pre>
+                  </article>
+                  <div v-if="!debugLogItems.length" class="py-10 text-center text-sm text-zinc-400">
+                    暂无调试日志，执行一次消息发送或工具调用后会出现记录。
                   </div>
                 </div>
               </div>
