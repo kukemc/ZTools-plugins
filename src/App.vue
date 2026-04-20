@@ -1,33 +1,115 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
+  Activity,
+  AlertTriangle,
   Bot,
   Bug,
   ChevronDown,
   Check,
+  Circle,
+  CircleDot,
+  CircleCheck,
+  Copy,
+  Download,
+  Eye,
+  EyeOff,
+  File as FileIcon,
+  FolderOpen,
+  Folder,
+  Image as ImageIcon,
+  ListChecks,
+  Paperclip,
   Plus,
   RefreshCw,
+  RotateCcw,
   Send,
   Settings,
+  Shield,
+  Sparkles,
   Terminal,
   Trash2,
+  Upload,
   User,
   Wrench,
   X,
   PanelLeftClose,
-  PanelLeftOpen,
-  Image as ImageIcon
+  PanelLeftOpen
 } from 'lucide-vue-next'
 import MarkdownIt from 'markdown-it'
+import hljs from 'highlight.js/lib/common'
+
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
+const renderHighlightedCode = (code: string, lang: string) => {
+  const language = String(lang || '').trim().toLowerCase()
+  let highlighted = ''
+  let displayLanguage = language || 'text'
+  try {
+    if (language && hljs.getLanguage(language)) {
+      highlighted = hljs.highlight(code, { language, ignoreIllegals: true }).value
+    } else if (language) {
+      highlighted = escapeHtml(code)
+    } else {
+      const auto = hljs.highlightAuto(code)
+      highlighted = auto.value || escapeHtml(code)
+      displayLanguage = auto.language || 'text'
+    }
+  } catch {
+    highlighted = escapeHtml(code)
+  }
+  const encoded = encodeURIComponent(code)
+  const safeLang = escapeHtml(displayLanguage)
+  return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${safeLang}</span><button type="button" class="md-code-copy" data-code="${encoded}" aria-label="复制代码"><span class="md-code-copy-icon" aria-hidden="true"></span><span class="md-code-copy-label">复制</span></button></div><pre class="md-code-pre hljs"><code class="hljs language-${safeLang}">${highlighted}</code></pre></div>`
+}
 
 const md = new MarkdownIt({
   breaks: true,
   linkify: true,
 })
 
-type MessageRole = 'assistant' | 'user' | 'system'
+md.renderer.rules.fence = (tokens, idx) => {
+  const token = tokens[idx]
+  const info = token.info ? token.info.trim() : ''
+  const langName = info ? info.split(/\s+/)[0] : ''
+  return `${renderHighlightedCode(token.content, langName)}\n`
+}
+
+md.renderer.rules.code_block = (tokens, idx) => {
+  const token = tokens[idx]
+  return `${renderHighlightedCode(token.content, '')}\n`
+}
+
+type MessageRole = 'assistant' | 'user' | 'system' | 'tool'
 
 type ToolInvocationStatus = 'draft' | 'pending' | 'running' | 'success' | 'error'
+
+type AttachmentKind = 'image' | 'file' | 'folder'
+
+interface Attachment {
+  id: string
+  kind: AttachmentKind
+  name: string
+  path: string
+  size?: number
+  mimeType?: string
+  previewDataUrl?: string
+}
+
+interface ToolDiff {
+  filePath?: string
+  addedLines: number
+  removedLines: number
+  diffText: string
+  tooLarge?: boolean
+  diffTruncated?: boolean
+}
 
 interface ToolInvocation {
   id: string
@@ -37,6 +119,34 @@ interface ToolInvocation {
   resultText: string
   status: ToolInvocationStatus
   expanded: boolean
+  diff?: ToolDiff | null
+}
+
+interface TextMessageBlock {
+  id: string
+  type: 'text'
+  content: string
+}
+
+interface ToolMessageBlock {
+  id: string
+  type: 'tool'
+  toolInvocation: ToolInvocation
+}
+
+type AssistantMessageBlock = TextMessageBlock | ToolMessageBlock
+
+interface ChangeSummaryFile {
+  path: string
+  added: number
+  removed: number
+  kind: string
+}
+
+interface ChangeSummary {
+  files: ChangeSummaryFile[]
+  addedLines: number
+  removedLines: number
 }
 
 interface ChatMessage {
@@ -46,6 +156,10 @@ interface ChatMessage {
   createdAt: number
   isStreaming?: boolean
   toolInvocations: ToolInvocation[]
+  blocks: AssistantMessageBlock[]
+  attachments?: Attachment[]
+  hasSnapshot?: boolean
+  changeSummary?: ChangeSummary | null
 }
 
 interface Provider {
@@ -54,6 +168,7 @@ interface Provider {
   baseURL: string
   apiKey: string
   models: string[]
+  showApiKey?: boolean
 }
 
 interface ChatSession {
@@ -61,6 +176,8 @@ interface ChatSession {
   title: string
   messages: ChatMessage[]
   updatedAt: number
+  systemPromptSnapshot?: string
+  titleGenerated?: boolean
 }
 
 interface DebugLogEntry {
@@ -72,7 +189,666 @@ interface DebugLogEntry {
   payload: Record<string, unknown>
 }
 
+interface SessionRuntimeState {
+  isLoading: boolean
+  activeRequestId: string | null
+  stopRequested: boolean
+  todos: TodoItem[]
+  todosUpdatedAt: number
+}
+
+type TodoStatus = 'pending' | 'in_progress' | 'completed'
+
+interface TodoItem {
+  content: string
+  activeForm: string
+  status: TodoStatus
+}
+
+type ComposerSendMode = 'enter' | 'ctrlEnter'
+
+type SafetyMode = 'strict' | 'moderate' | 'loose' | 'allowlist'
+
+type ToolRiskLevel = 'low' | 'medium' | 'high'
+
+type AllowListKind = 'white' | 'black'
+
+interface AppSettings {
+  enableToolRoundLimit: boolean
+  maxToolCallRounds: number
+  composerSendMode: ComposerSendMode
+  autoExpandToolDetails: boolean
+  autoRefreshDebugLogs: boolean
+  enableStreamResponse: boolean
+  autoScrollWhileStreaming: boolean
+  enableLocalTools: boolean
+  enabledToolNames: string[]
+  tavilyApiKey: string
+  stopWhenToolError: boolean
+  safetyMode: SafetyMode
+  moderateOnlyHigh: boolean
+  toolListKind: AllowListKind
+  toolListNames: string[]
+  commandListKind: AllowListKind
+  commandListPatterns: string[]
+  workspaceRoot: string
+  launchAutoSend: boolean
+}
+
+type ToolCategoryId = 'environment' | 'file' | 'task'
+
+interface ToolDefinitionSchema {
+  type: 'object'
+  properties: Record<string, unknown>
+  required?: string[]
+}
+
+interface ToolDefinition {
+  name: string
+  label: string
+  purpose: string
+  summary: string
+  category: ToolCategoryId
+  categoryLabel: string
+  capabilityLabel: string
+  riskLabel: string
+  description: string
+  parameters: ToolDefinitionSchema
+  legacyNames?: string[]
+}
+
+const toolCategories = [
+  {
+    id: 'environment' as const,
+    label: '环境与联网工具',
+    description: '执行命令、抓取网页、联网搜索，帮助 Agent 探测外部环境。',
+  },
+  {
+    id: 'file' as const,
+    label: '文件工具',
+    description: '读、写、改、删、检索本地文件与 Jupyter notebook，覆盖日常代码与文档工作。',
+  },
+  {
+    id: 'task' as const,
+    label: '任务与计划',
+    description: '让模型显式规划步骤并实时更新进度，用于复杂多步任务。',
+  },
+]
+
+const toolCatalog: ToolDefinition[] = [
+  {
+    name: 'BashTool',
+    label: 'BashTool',
+    purpose: '执行 Shell 命令',
+    summary: '跑构建/测试/脚本/后台 dev server',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '执行',
+    riskLabel: '高风险',
+    description: '在本地终端执行 Shell 命令。支持 description（一句话说明用途）、timeout（毫秒，默认 120000，最大 600000）。如果是 dev server、watcher、长构建这类长时间运行的命令，必须把 runInBackground 设为 true —— 会立刻返回 bashId，之后用 BashOutputTool 拉取输出、用 KillShellTool 终止。单次 stdout/stderr 超过 40KB 或 400 行会被自动截断（保留首 80 + 末 320 行），如需完整输出请写到文件再用 FileReadTool 分页读。调用前必须评估 riskLevel：只读查询 low，修改项目文件/安装包 medium，删除、影响系统配置、不可逆操作 high。',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '要执行的 Shell 命令' },
+        cwd: { type: 'string', description: '命令执行的工作目录，默认当前 workspace' },
+        description: { type: 'string', description: '一句话说明这次命令要做什么（便于回溯/调试）' },
+        timeout: { type: 'number', description: '同步模式的超时（毫秒），默认 120000，最大 600000' },
+        runInBackground: { type: 'boolean', description: '是否后台运行：dev server / watch / 长跑命令必须传 true，返回 bashId' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=只读查询；medium=安装依赖/修改项目文件；high=删除、修改系统配置、不可逆操作',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['command', 'riskLevel', 'riskReason'],
+    },
+    legacyNames: ['execCommand'],
+  },
+  {
+    name: 'BashOutputTool',
+    label: 'BashOutputTool',
+    purpose: '拉取后台 Bash 输出',
+    summary: '读取 runInBackground 的 stdout/stderr',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '读取',
+    riskLabel: '低风险',
+    description: '读取 runInBackground=true 的 BashTool 自上次拉取以来新增的 stdout / stderr，以及当前进程状态（running / completed / exited / killed）。可选用正则 filter 过滤行。后台任务期间应定期轮询直到 status !== running 或得到想要的输出。',
+    parameters: {
+      type: 'object',
+      properties: {
+        bashId: { type: 'string', description: 'BashTool(runInBackground=true) 返回的 bashId' },
+        filter: { type: 'string', description: '可选正则，仅保留匹配此正则的行' },
+      },
+      required: ['bashId'],
+    },
+  },
+  {
+    name: 'KillShellTool',
+    label: 'KillShellTool',
+    purpose: '终止后台 Bash',
+    summary: '杀掉 runInBackground 启动的进程',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '终止',
+    riskLabel: '中风险',
+    description: '终止一个由 BashTool(runInBackground=true) 启动、现在仍在运行的后台进程。先发 SIGTERM，500ms 后仍未退出则 SIGKILL。',
+    parameters: {
+      type: 'object',
+      properties: {
+        bashId: { type: 'string', description: '要终止的后台进程 bashId' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: '一般为 low 或 medium',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['bashId', 'riskLevel', 'riskReason'],
+    },
+  },
+  {
+    name: 'GetWorkspaceRootTool',
+    label: 'GetWorkspaceRootTool',
+    purpose: '查询当前工作目录',
+    summary: '确认后续工具的默认 cwd',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '读取',
+    riskLabel: '低风险',
+    description: '返回本插件进程当前的 cwd。BashTool / GlobTool / GrepTool / FileReadTool 等在未显式传 cwd/path 时会以此为基准。开始工作前可以先调它确认自己站在哪个目录。',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'SetWorkspaceRootTool',
+    label: 'SetWorkspaceRootTool',
+    purpose: '切换默认工作目录',
+    summary: '把进程 cwd 切到目标目录，后续工具按新 cwd 解析相对路径',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '配置',
+    riskLabel: '中风险',
+    description: '修改本插件进程的 cwd。切换后，所有未显式传 cwd/path 的 BashTool / GlobTool / GrepTool / FileRead/Edit/Write/Delete 调用都会以新 cwd 为基准解析相对路径。不会修改用户设置里持久化的 workspaceRoot，下次重启回到用户配置值。切换到系统目录、磁盘根、用户不熟悉的目录时必须 high 风险并说明原因。',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '目标目录的绝对路径' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=用户已知项目目录；medium=首次进入的目录；high=系统目录/磁盘根/不熟悉位置',
+        },
+        riskReason: { type: 'string', description: '一句话说明为什么切到这里' },
+      },
+      required: ['path', 'riskLevel', 'riskReason'],
+    },
+  },
+  {
+    name: 'WebFetchTool',
+    label: 'WebFetchTool',
+    purpose: '抓取并按 prompt 摘要网页',
+    summary: '已知网址时读取页面、可选 LLM 摘要',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '联网',
+    riskLabel: '中风险',
+    description: '抓取指定 URL 的网页正文（自动 HTML→纯文本、截断到 50000 字符）。如果同时提供 prompt，会用当前会话的 LLM 按 prompt 对页面做一次摘要/问答，返回 analysis 字段。禁止访问本地或内网地址。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '要抓取的完整网页地址' },
+        prompt: { type: 'string', description: '可选：用自然语言描述你要从这个页面里获得什么，LLM 会据此做摘要/回答' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'WebSearchTool',
+    label: 'WebSearchTool',
+    purpose: '联网搜索（Tavily）',
+    summary: '不知道网址时先搜，支持域名过滤',
+    category: 'environment',
+    categoryLabel: '环境与联网工具',
+    capabilityLabel: '联网',
+    riskLabel: '中风险',
+    description: '使用 Tavily 做联网搜索。支持 allowedDomains / blockedDomains 过滤（域名支持 *.example.com 通配）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词或问题' },
+        count: { type: 'number', description: '返回结果数量，默认 5，上限 10' },
+        allowedDomains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '仅保留命中这些域名的结果（支持 *.example.com）',
+        },
+        blockedDomains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '过滤掉命中这些域名的结果（支持 *.example.com）',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'FileReadTool',
+    label: 'FileReadTool',
+    purpose: '读取文件内容（带行号）',
+    summary: '看代码/配置/文档，支持 offset/limit 分页',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '只读',
+    riskLabel: '低风险',
+    description: '读取本地文件内容。默认返回前 2000 行（cat -n 格式，含行号）。大文件请用 offset/limit 分页读，超长行会被截断为 2000 字符。图片自动转 dataURL；.ipynb 以 cell 边界平铺；PDF 不直接解析（请先用 BashTool 的 pdftotext 转换）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: '文件绝对路径或相对路径' },
+        offset: { type: 'number', description: '起始行（0-based），默认 0' },
+        limit: { type: 'number', description: '最多返回多少行，默认 2000' },
+      },
+      required: ['filePath'],
+    },
+    legacyNames: ['readFile'],
+  },
+  {
+    name: 'FileEditTool',
+    label: 'FileEditTool',
+    purpose: '按补丁方式编辑文件',
+    summary: '精准替换已有文件中的片段',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '编辑',
+    riskLabel: '中风险',
+    description: '基于查找替换或 edits 补丁列表精确修改文件。建议在修改前先用 FileReadTool 读取最新内容，避免用过时片段替换。old_string/new_string 等价于 oldText/newText 和 search/replace。默认单次替换必须唯一命中，命中多处需显式 replaceAll=true。调用前必须评估 riskLevel：改临时/测试文件 low，改项目源码 medium，改系统配置/关键数据 high。',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: '目标文件路径' },
+        old_string: { type: 'string', description: '要替换的原始文本（别名：oldText / search）' },
+        new_string: { type: 'string', description: '替换后的文本（别名：newText / replace）' },
+        replaceAll: { type: 'boolean', description: '是否替换所有匹配，默认 false（多处匹配会报错以防误改）' },
+        edits: {
+          type: 'array',
+          description: '批量补丁：每项含 old_string/new_string（或 oldText/newText / search/replace）与可选 replaceAll',
+          items: {
+            type: 'object',
+            properties: {
+              old_string: { type: 'string' },
+              new_string: { type: 'string' },
+              oldText: { type: 'string' },
+              newText: { type: 'string' },
+              search: { type: 'string' },
+              replace: { type: 'string' },
+              replaceAll: { type: 'boolean' },
+            },
+          },
+        },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=临时/测试文件；medium=项目源码；high=系统配置/关键数据',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['filePath', 'riskLevel', 'riskReason'],
+    },
+  },
+  {
+    name: 'FileWriteTool',
+    label: 'FileWriteTool',
+    purpose: '直接写入整个文件',
+    summary: '新建文件或整体重写',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '写入',
+    riskLabel: '高风险',
+    description: '将完整文本写入目标文件。若文件已存在，建议先 FileReadTool 读一遍当前内容，或者改用 FileEditTool 做局部替换（更安全、diff 更清晰）。调用前必须评估 riskLevel：新建临时文件 low，整体重写项目源码 medium，覆盖系统配置/破坏数据 high。',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: '目标文件路径' },
+        content: { type: 'string', description: '要写入的完整文件内容' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=新建临时文件；medium=整体重写项目源码；high=覆盖配置/破坏数据',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['filePath', 'content', 'riskLevel', 'riskReason'],
+    },
+    legacyNames: ['writeFile'],
+  },
+  {
+    name: 'FileDeleteTool',
+    label: 'FileDeleteTool',
+    purpose: '删除文件或目录',
+    summary: '删除前自动快照，可通过消息回滚恢复',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '删除',
+    riskLabel: '高风险',
+    description: '删除指定的文件或目录（目录需 recursive=true）。本工具会在删除前自动保存快照，用户可通过"回滚到此处"恢复。**删文件/目录务必使用本工具，不要用 BashTool 的 rm / rmdir / del / Remove-Item 等命令**，否则无法回滚。',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: '要删除的文件或目录的绝对路径' },
+        recursive: { type: 'boolean', description: '目标是目录时必须传 true 才能删除，默认 false' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=临时产物；medium=项目文件；high=系统配置/不可逆数据',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['filePath', 'riskLevel', 'riskReason'],
+    },
+  },
+  {
+    name: 'NotebookEditTool',
+    label: 'NotebookEditTool',
+    purpose: '编辑 Jupyter Notebook cell',
+    summary: '替换 / 插入 / 删除 .ipynb 单元格',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '编辑',
+    riskLabel: '中风险',
+    description: '对 .ipynb notebook 的单元格进行原子级修改：editMode=replace（替换单元格源码和/或类型）、insert（在指定 cellId 之后插入新 cell，无 cellId 时插到开头）、delete（删除单元格）。替换/插入时必须传 newSource；插入必须指定 cellType（code | markdown）。修改前会自动快照以支持回滚。',
+    parameters: {
+      type: 'object',
+      properties: {
+        notebookPath: { type: 'string', description: '.ipynb 文件的绝对路径' },
+        cellId: { type: 'string', description: '要操作的 cell 的 id（或十进制索引字符串）；insert 可省略以插到开头' },
+        cellType: { type: 'string', enum: ['code', 'markdown'], description: 'insert 必填；replace 时可用于同时改类型' },
+        editMode: { type: 'string', enum: ['replace', 'insert', 'delete'], description: '编辑模式，默认 replace' },
+        newSource: { type: 'string', description: 'replace / insert 时写入的 cell 源码（markdown 也是字符串）' },
+        riskLevel: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'low=临时 notebook；medium=项目 notebook；high=关键实验',
+        },
+        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
+      },
+      required: ['notebookPath', 'riskLevel', 'riskReason'],
+    },
+  },
+  {
+    name: 'GlobTool',
+    label: 'GlobTool',
+    purpose: '按路径模式查找文件',
+    summary: '结果按最近修改时间降序',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '检索',
+    riskLabel: '低风险',
+    description: '按 glob 模式查找文件或目录，返回按 mtime 降序排序的列表（最新改动的排最上）。用来快速定位"最近改过的相关文件"。',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'glob 路径模式，如 **/*.ts、src/**/*.vue' },
+        path: { type: 'string', description: '搜索起始目录，可选' },
+        includeDirectories: { type: 'boolean', description: '是否同时返回目录，默认 false' },
+        limit: { type: 'number', description: '最多返回多少条，默认 200' },
+      },
+      required: ['pattern'],
+    },
+    legacyNames: ['readDir'],
+  },
+  {
+    name: 'GrepTool',
+    label: 'GrepTool',
+    purpose: '在代码中搜索内容',
+    summary: '支持三种输出模式、上下文、类型过滤、multiline',
+    category: 'file',
+    categoryLabel: '文件工具',
+    capabilityLabel: '检索',
+    riskLabel: '低风险',
+    description: '在目录或单个文件中按正则搜索。三种 outputMode：files_with_matches（默认，只返回命中的文件路径，最省 token，适合先定位）、content（返回匹配行 + 可选上下文，适合要看现场）、count（每文件匹配次数，估量级）。支持 type（js/ts/py/vue/go 等快捷分类）、glob（文件名过滤）、multiline（跨行匹配，用 [\\s\\S] 语义）、beforeContext/afterContext/context、caseSensitive、headLimit+offset 分页。pattern 默认按正则处理（isRegex=true）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '正则或字面量字符串' },
+        path: { type: 'string', description: '搜索起点目录或单个文件，可选' },
+        glob: { type: 'string', description: '文件名 glob 过滤，如 *.ts、src/**/*.vue' },
+        type: { type: 'string', description: '按文件类型过滤：js / ts / py / vue / go / rust / md / json / yaml 等，可用逗号分隔多个' },
+        outputMode: {
+          type: 'string',
+          enum: ['files_with_matches', 'content', 'count'],
+          description: '默认 files_with_matches',
+        },
+        isRegex: { type: 'boolean', description: '是否把 pattern 当正则处理，默认 true' },
+        caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
+        multiline: { type: 'boolean', description: '跨行匹配（. 匹配换行），默认 false' },
+        beforeContext: { type: 'number', description: 'content 模式下每个匹配前附带几行上下文' },
+        afterContext: { type: 'number', description: 'content 模式下每个匹配后附带几行上下文' },
+        context: { type: 'number', description: 'beforeContext 和 afterContext 的统一简写' },
+        showLineNumbers: { type: 'boolean', description: 'content 模式是否显示行号，默认 true' },
+        headLimit: { type: 'number', description: '最多返回多少条结果，默认 250' },
+        offset: { type: 'number', description: '从第几条开始返回（分页），默认 0' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'TodoWriteTool',
+    label: 'TodoWriteTool',
+    purpose: '维护当前会话的任务计划',
+    summary: '拆分复杂任务、实时更新进度',
+    category: 'task',
+    categoryLabel: '任务与计划',
+    capabilityLabel: '规划',
+    riskLabel: '低风险',
+    description: '把当前任务拆成步骤清单并维护进度。每次调用会完整替换当前会话的 todos。每一项包含：content（祈使句，例如"修复登录校验 bug"）、activeForm（进行时，例如"修复登录校验 bug 中"）、status（pending / in_progress / completed）。同一时间只允许一个 in_progress。复杂多步任务（≥3 步）开工前就要先列 todo；每完成一步立即调用本工具把对应项从 in_progress 切到 completed，并把下一步切到 in_progress。',
+    parameters: {
+      type: 'object',
+      properties: {
+        todos: {
+          type: 'array',
+          description: '完整的任务列表（替换式）',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: '任务内容（祈使句）' },
+              activeForm: { type: 'string', description: '任务进行时描述' },
+              status: {
+                type: 'string',
+                enum: ['pending', 'in_progress', 'completed'],
+                description: '任务状态',
+              },
+            },
+            required: ['content', 'activeForm', 'status'],
+          },
+        },
+      },
+      required: ['todos'],
+    },
+  },
+]
+
+const toolCatalogMap = new Map<string, ToolDefinition>()
+toolCatalog.forEach((tool) => {
+  toolCatalogMap.set(tool.name, tool)
+  ;(tool.legacyNames ?? []).forEach((legacyName) => {
+    toolCatalogMap.set(legacyName, tool)
+  })
+})
+
+const getDefaultEnabledToolNames = () => toolCatalog.map((tool) => tool.name)
+
+const normalizeEnabledToolNames = (value: unknown) => {
+  const availableToolNames = new Set(toolCatalog.map((tool) => tool.name))
+  if (!Array.isArray(value)) {
+    return getDefaultEnabledToolNames()
+  }
+
+  const normalized = Array.from(
+    new Set(
+      value
+        .map((item) => String(item))
+        .map((name) => toolCatalogMap.get(name)?.name ?? '')
+        .filter((name) => availableToolNames.has(name)),
+    ),
+  )
+
+  return normalized.length ? normalized : getDefaultEnabledToolNames()
+}
+
+const MAX_TOOL_CALL_ROUNDS_SAFETY_CAP = 24
+const DEFAULT_MAX_TOOL_CALL_ROUNDS = 6
+
+const defaultAppSettings: AppSettings = {
+  enableToolRoundLimit: false,
+  maxToolCallRounds: DEFAULT_MAX_TOOL_CALL_ROUNDS,
+  composerSendMode: 'enter',
+  autoExpandToolDetails: false,
+  autoRefreshDebugLogs: true,
+  enableStreamResponse: true,
+  autoScrollWhileStreaming: true,
+  enableLocalTools: true,
+  enabledToolNames: getDefaultEnabledToolNames(),
+  tavilyApiKey: '',
+  stopWhenToolError: false,
+  safetyMode: 'moderate',
+  moderateOnlyHigh: false,
+  toolListKind: 'black',
+  toolListNames: [],
+  commandListKind: 'black',
+  commandListPatterns: [],
+  workspaceRoot: '',
+  launchAutoSend: false,
+}
+
 const createMessageId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+
+const createBlockId = () => `block_${createMessageId()}`
+
+const clampToolRoundLimit = (value: unknown) => {
+  const parsedValue = Number(value)
+  if (!Number.isFinite(parsedValue)) {
+    return DEFAULT_MAX_TOOL_CALL_ROUNDS
+  }
+  return Math.min(MAX_TOOL_CALL_ROUNDS_SAFETY_CAP, Math.max(1, Math.round(parsedValue)))
+}
+
+const normalizeComposerSendMode = (value: unknown): ComposerSendMode =>
+  value === 'ctrlEnter' ? 'ctrlEnter' : 'enter'
+
+const cloneAppSettings = (settings: AppSettings): AppSettings => ({
+  ...settings,
+})
+
+const normalizeSafetyMode = (value: unknown): SafetyMode => {
+  if (value === 'strict' || value === 'loose' || value === 'moderate' || value === 'allowlist') return value
+  return 'moderate'
+}
+
+const normalizeAllowListKind = (value: unknown): AllowListKind =>
+  value === 'white' ? 'white' : 'black'
+
+const normalizeStringArray = (value: unknown, limit = 500): string[] => {
+  if (!Array.isArray(value)) return []
+  const result: string[] = []
+  const seen = new Set<string>()
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    result.push(trimmed)
+    if (result.length >= limit) break
+  }
+  return result
+}
+
+const normalizeAppSettings = (value: unknown): AppSettings => {
+  const current = typeof value === 'object' && value !== null ? value as Partial<AppSettings> : {}
+
+  return {
+    enableToolRoundLimit: Boolean(current.enableToolRoundLimit),
+    maxToolCallRounds: clampToolRoundLimit(current.maxToolCallRounds),
+    composerSendMode: normalizeComposerSendMode(current.composerSendMode),
+    autoExpandToolDetails: current.autoExpandToolDetails === true,
+    autoRefreshDebugLogs: current.autoRefreshDebugLogs !== false,
+    enableStreamResponse: current.enableStreamResponse !== false,
+    autoScrollWhileStreaming: current.autoScrollWhileStreaming !== false,
+    enableLocalTools: current.enableLocalTools !== false,
+    enabledToolNames: normalizeEnabledToolNames(current.enabledToolNames),
+    tavilyApiKey: String(current.tavilyApiKey ?? ''),
+    stopWhenToolError: Boolean(current.stopWhenToolError),
+    safetyMode: normalizeSafetyMode(current.safetyMode),
+    moderateOnlyHigh: Boolean(current.moderateOnlyHigh),
+    toolListKind: normalizeAllowListKind(current.toolListKind),
+    toolListNames: normalizeStringArray(current.toolListNames, 64),
+    commandListKind: normalizeAllowListKind(current.commandListKind),
+    commandListPatterns: normalizeStringArray(current.commandListPatterns, 256),
+    workspaceRoot: String(current.workspaceRoot ?? '').trim(),
+    launchAutoSend: current.launchAutoSend === true,
+  }
+}
+
+const normalizeToolDiff = (value: unknown): ToolDiff | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Partial<ToolDiff>
+  if (typeof raw.diffText !== 'string') return null
+  const added = Number(raw.addedLines)
+  const removed = Number(raw.removedLines)
+  if (!Number.isFinite(added) || !Number.isFinite(removed)) return null
+  return {
+    filePath: typeof raw.filePath === 'string' ? raw.filePath : undefined,
+    addedLines: Math.max(0, Math.floor(added)),
+    removedLines: Math.max(0, Math.floor(removed)),
+    diffText: raw.diffText,
+    tooLarge: Boolean(raw.tooLarge),
+    diffTruncated: Boolean(raw.diffTruncated),
+  }
+}
+
+const normalizeChangeSummary = (value: unknown): ChangeSummary | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Partial<ChangeSummary>
+  const files = Array.isArray(raw.files)
+    ? raw.files
+        .filter(Boolean)
+        .map((file) => {
+          const entry = file as Partial<ChangeSummaryFile>
+          const path = String(entry?.path ?? '').trim()
+          if (!path) return null
+          return {
+            path,
+            added: Math.max(0, Math.floor(Number(entry?.added) || 0)),
+            removed: Math.max(0, Math.floor(Number(entry?.removed) || 0)),
+            kind: String(entry?.kind ?? ''),
+          } satisfies ChangeSummaryFile
+        })
+        .filter((item): item is ChangeSummaryFile => item !== null)
+    : []
+  if (!files.length) return null
+  const addedLines = files.reduce((sum, file) => sum + file.added, 0)
+  const removedLines = files.reduce((sum, file) => sum + file.removed, 0)
+  return { files, addedLines, removedLines }
+}
+
+const normalizeToolInvocation = (value: unknown, index: number): ToolInvocation => {
+  const current = value as Partial<ToolInvocation>
+  const normalizedStatus = String(current.status ?? 'pending')
+  const allowedStatus: ToolInvocationStatus[] = ['draft', 'pending', 'running', 'success', 'error']
+
+  return {
+    id: String(current.id ?? `tool_${index}`),
+    callId: String(current.callId ?? current.id ?? `tool_${index}`),
+    name: String(current.name ?? ''),
+    argumentsText: String(current.argumentsText ?? ''),
+    resultText: String(current.resultText ?? ''),
+    status: allowedStatus.includes(normalizedStatus as ToolInvocationStatus)
+      ? (normalizedStatus as ToolInvocationStatus)
+      : 'pending',
+    expanded: Boolean(current.expanded),
+    diff: normalizeToolDiff(current.diff),
+  }
+}
 
 const normalizeToolInvocations = (value: unknown): ToolInvocation[] => {
   if (!Array.isArray(value)) {
@@ -81,24 +857,144 @@ const normalizeToolInvocations = (value: unknown): ToolInvocation[] => {
 
   return value
     .filter(Boolean)
-    .map((tool, index) => {
-      const current = tool as Partial<ToolInvocation>
-      const normalizedStatus = String(current.status ?? 'pending')
-      const allowedStatus: ToolInvocationStatus[] = ['draft', 'pending', 'running', 'success', 'error']
-
-      return {
-        id: String(current.id ?? `tool_${index}`),
-        callId: String(current.callId ?? current.id ?? `tool_${index}`),
-        name: String(current.name ?? ''),
-        argumentsText: String(current.argumentsText ?? ''),
-        resultText: String(current.resultText ?? ''),
-        status: allowedStatus.includes(normalizedStatus as ToolInvocationStatus)
-          ? (normalizedStatus as ToolInvocationStatus)
-          : 'pending',
-        expanded: Boolean(current.expanded),
-      }
-    })
+    .map((tool, index) => normalizeToolInvocation(tool, index))
 }
+
+const cloneToolInvocation = (toolInvocation: ToolInvocation): ToolInvocation => ({
+  ...toolInvocation,
+})
+
+const cloneMessageBlocks = (blocks: AssistantMessageBlock[]) =>
+  blocks.map((block) => (
+    block.type === 'text'
+      ? { ...block }
+      : {
+          ...block,
+          toolInvocation: cloneToolInvocation(block.toolInvocation),
+        }
+  ))
+
+const buildAssistantContentFromBlocks = (blocks: AssistantMessageBlock[]) =>
+  blocks
+    .filter((block): block is TextMessageBlock => block.type === 'text')
+    .map((block) => block.content)
+    .filter(Boolean)
+    .join('\n\n')
+
+const buildToolInvocationsFromBlocks = (blocks: AssistantMessageBlock[]) =>
+  blocks
+    .filter((block): block is ToolMessageBlock => block.type === 'tool')
+    .map((block) => cloneToolInvocation(block.toolInvocation))
+
+const normalizeMessageBlocks = (
+  value: unknown,
+  fallbackContent = '',
+  fallbackToolInvocations: ToolInvocation[] = [],
+): AssistantMessageBlock[] => {
+  if (Array.isArray(value)) {
+    return value
+      .filter(Boolean)
+      .map((block, index) => {
+        const current = block as Record<string, unknown>
+        const type = current.type === 'tool' ? 'tool' : 'text'
+
+        if (type === 'tool') {
+          return {
+            id: String(current.id ?? createBlockId()),
+            type: 'tool' as const,
+            toolInvocation: normalizeToolInvocation(
+              current.toolInvocation ?? current.tool ?? current,
+              index,
+            ),
+          }
+        }
+
+        return {
+          id: String(current.id ?? createBlockId()),
+          type: 'text' as const,
+          content: String(current.content ?? ''),
+        }
+      })
+  }
+
+  const fallbackBlocks: AssistantMessageBlock[] = []
+  if (fallbackContent) {
+    fallbackBlocks.push({
+      id: createBlockId(),
+      type: 'text',
+      content: fallbackContent,
+    })
+  }
+
+  fallbackToolInvocations.forEach((toolInvocation) => {
+    fallbackBlocks.push({
+      id: createBlockId(),
+      type: 'tool',
+      toolInvocation: cloneToolInvocation(toolInvocation),
+    })
+  })
+
+  return fallbackBlocks
+}
+
+const syncAssistantMessageState = (message: ChatMessage): ChatMessage => {
+  if (message.role !== 'assistant') {
+    return {
+      ...message,
+      blocks: [],
+    }
+  }
+
+  const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
+  return {
+    ...message,
+    blocks: nextBlocks,
+    content: buildAssistantContentFromBlocks(nextBlocks),
+    toolInvocations: buildToolInvocationsFromBlocks(nextBlocks),
+  }
+}
+
+const normalizeAttachment = (value: unknown, index: number): Attachment | null => {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+  const current = value as Partial<Attachment>
+  const kind = current.kind === 'image' || current.kind === 'folder' ? current.kind : 'file'
+  const path = String(current.path ?? '').trim()
+  const name = String(current.name ?? '').trim()
+  if (!path && !name) {
+    return null
+  }
+  return {
+    id: String(current.id ?? `att_${Date.now()}_${index}`),
+    kind,
+    name: name || path.split(/[\\/]/).pop() || '附件',
+    path,
+    size: typeof current.size === 'number' ? current.size : undefined,
+    mimeType: typeof current.mimeType === 'string' ? current.mimeType : undefined,
+  }
+}
+
+const normalizeAttachments = (value: unknown): Attachment[] => {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((item, index) => normalizeAttachment(item, index))
+    .filter((item): item is Attachment => item !== null)
+}
+
+const serializeAttachmentForStorage = (attachment: Attachment): Attachment => ({
+  id: attachment.id,
+  kind: attachment.kind,
+  name: attachment.name,
+  path: attachment.path,
+  size: attachment.size,
+  mimeType: attachment.mimeType,
+})
+
+const cloneAttachments = (list: Attachment[] | undefined): Attachment[] =>
+  Array.isArray(list) ? list.map((item) => ({ ...item })) : []
 
 const createMessage = (
   role: MessageRole,
@@ -111,6 +1007,13 @@ const createMessage = (
   createdAt: Date.now(),
   isStreaming: false,
   toolInvocations: [],
+  blocks: role === 'assistant'
+    ? (content
+      ? [{ id: createBlockId(), type: 'text', content }]
+      : [])
+    : [],
+  attachments: [],
+  hasSnapshot: false,
   ...options,
 })
 
@@ -123,14 +1026,31 @@ const normalizeMessages = (value: unknown): ChatMessage[] => {
     .filter(Boolean)
     .map((message, index) => {
       const current = message as Partial<ChatMessage>
-      return {
+      const role = (current.role ?? 'system') as MessageRole
+      const normalizedToolInvocations = normalizeToolInvocations(current.toolInvocations)
+      const normalizedAttachments = normalizeAttachments(
+        (current as Partial<ChatMessage> & { attachments?: unknown }).attachments,
+      )
+      const normalizedMessage: ChatMessage = {
         id: String(current.id ?? `message_${Date.now()}_${index}`),
-        role: (current.role ?? 'system') as MessageRole,
+        role,
         content: String(current.content ?? ''),
         createdAt: Number(current.createdAt ?? Date.now() + index),
         isStreaming: false,
-        toolInvocations: normalizeToolInvocations(current.toolInvocations),
+        toolInvocations: normalizedToolInvocations,
+        blocks: role === 'assistant'
+          ? normalizeMessageBlocks(
+              (current as Partial<ChatMessage> & { blocks?: unknown }).blocks,
+              String(current.content ?? ''),
+              normalizedToolInvocations,
+            )
+          : [],
+        attachments: normalizedAttachments,
+        hasSnapshot: Boolean((current as Partial<ChatMessage>).hasSnapshot),
+        changeSummary: normalizeChangeSummary((current as Partial<ChatMessage>).changeSummary),
       }
+
+      return role === 'assistant' ? syncAssistantMessageState(normalizedMessage) : normalizedMessage
     })
 }
 
@@ -151,6 +1071,55 @@ const createDefaultProviders = (): Provider[] => [
   },
 ]
 
+const defaultSystemPrompt = `你是 Kuke 本地 AI Agent，可以在用户的机器上按需调用工具来完成任务。
+
+【当前环境】
+- 当前时间：{{currentTime}}（{{timezone}}）
+- 操作系统：{{osType}} {{osRelease}} · {{platform}}/{{arch}}
+- 工作目录：{{cwd}}
+- 当前用户：{{user}}@{{hostname}}
+- Node 版本：{{nodeVersion}}
+
+【可用工具】
+- 文件：FileReadTool（支持 offset/limit 分页；图片/ipynb 自动识别）、FileEditTool（精确替换；修改前先 FileReadTool 读最新内容）、FileWriteTool（整文件重写；已有文件建议改用 FileEditTool）、FileDeleteTool（带快照回滚）、NotebookEditTool（Jupyter cell 级编辑）
+- 检索：GlobTool（按 mtime 倒序找文件）、GrepTool（三种 outputMode：files_with_matches/content/count；支持 type 过滤、multiline、上下文）
+- 终端：BashTool（同步执行；长任务务必 runInBackground=true）、BashOutputTool（拉取后台 stdout/stderr）、KillShellTool（终止后台进程）
+- 网络：WebFetchTool（含可选 prompt 摘要）、WebSearchTool（支持域名白/黑名单）
+- 规划：TodoWriteTool（拆步骤、实时更新进度）
+
+【工作原则】
+1. 开工前先 GetWorkspaceRootTool 确认当前 cwd；如果不是期望的项目目录，立即用 SetWorkspaceRootTool 切过去，避免在系统目录里瞎跑 ls/dir 把上下文打爆。
+2. 复杂多步任务（≥3 步）开工前先用 TodoWriteTool 列任务清单；每完成一步立即更新对应项状态，保持同一时间只有一个 in_progress。
+3. 先 GlobTool/GrepTool 定位 → 再 FileReadTool 读精确内容 → 再 FileEditTool 做最小改动。搜代码优先用 GrepTool 的 files_with_matches 省 token，要看现场再切 content + context。
+4. 读大文件时用 FileReadTool 的 offset/limit 分页，不要盲目读整份。BashTool 产生的大输出会自动截断，如需完整内容请重定向到文件再 FileReadTool 分页。
+5. 文件操作一律优先用专用工具，系统会自动快照支持回滚；**不要用 BashTool 的 rm / del / Remove-Item / mv / cp / sed -i / echo > 等命令替代**。
+6. 跑 dev server / watch / 长构建/ 长脚本时必须 BashTool 加 runInBackground=true，之后用 BashOutputTool 轮询输出，任务结束或不再需要时用 KillShellTool 关闭。
+7. 需要联网时：已知 URL → WebFetchTool；如果要针对性问题就再带上 prompt；未知 URL → WebSearchTool，可用 allowedDomains / blockedDomains 聚焦信源。
+8. 每次调用 BashTool / FileEditTool / FileWriteTool / FileDeleteTool / NotebookEditTool / KillShellTool / SetWorkspaceRootTool 都必须如实评估 riskLevel（low=临时/只读；medium=项目文件；high=删除、系统配置、不可逆操作）并在 riskReason 写一句解释。
+9. 执行写入、删除、命令等有副作用的操作前，先简要说明目标、影响范围；回复保持简洁、结构化、可执行。`
+
+const systemPromptPresets = [
+  {
+    id: 'general',
+    label: '通用 Agent',
+    prompt: defaultSystemPrompt,
+  },
+  {
+    id: 'coding',
+    label: '代码协作',
+    prompt: `你是 Kuke 本地开发协作助手。当前时间 {{currentTime}}，工作目录 {{cwd}}（{{osType}} {{arch}}）。
+
+工作流：复杂任务先 TodoWriteTool 列步骤 → GlobTool/GrepTool 定位相关文件（GrepTool 优先 files_with_matches，要看现场再切 content+context）→ FileReadTool 读精确内容（大文件用 offset/limit 分页）→ FileEditTool 做最小局部修改 → 需要跑 dev server/测试/构建时用 BashTool（长任务 runInBackground=true + BashOutputTool 轮询）。每完成一步立刻 TodoWriteTool 更新状态。输出保持结构清晰、可执行，说明改动范围与影响。`,
+  },
+  {
+    id: 'automation',
+    label: '系统执行',
+    prompt: `你是 Kuke 本地自动化执行助手。当前时间 {{currentTime}}，系统 {{osType}} {{osRelease}}，工作目录 {{cwd}}。
+
+调用文件与命令工具前先确认目标与风险，并在 riskLevel/riskReason 如实填写。长任务（dev server、watcher、构建）用 BashTool 的 runInBackground=true，再用 BashOutputTool 轮询；不再需要时 KillShellTool 关闭。删文件用 FileDeleteTool（带快照回滚），不要用 rm/del/Remove-Item。回复聚焦执行结果、副作用与回滚方式。`,
+  },
+]
+
 const loadProviders = (): Provider[] => {
   const stored = localStorage.getItem('kuke_providers')
   if (!stored) {
@@ -165,29 +1134,480 @@ const loadProviders = (): Provider[] => {
   }
 }
 
+const loadAppSettings = (): AppSettings => {
+  const stored = localStorage.getItem('kuke_settings')
+  if (!stored) {
+    return cloneAppSettings(defaultAppSettings)
+  }
+
+  try {
+    return normalizeAppSettings(JSON.parse(stored))
+  } catch {
+    return cloneAppSettings(defaultAppSettings)
+  }
+}
+
 const messages = ref<ChatMessage[]>([])
 const input = ref('')
+const composerAttachments = ref<Attachment[]>([])
+const isComposerDragActive = ref(false)
+const isPlusMenuOpen = ref(false)
+const fileInputRef = ref<HTMLInputElement | null>(null)
+const folderInputRef = ref<HTMLInputElement | null>(null)
+const imageInputRef = ref<HTMLInputElement | null>(null)
+const plusMenuRef = ref<HTMLElement | null>(null)
+const messageImagePreview = ref<Record<string, string>>({})
+const imagePreviewLoading = ref<Set<string>>(new Set())
 const manualModelInput = ref('')
-const isLoading = ref(false)
 const showSettings = ref(false)
-const activeSettingsTab = ref('providers')
+const activeSettingsTab = ref('tools')
 const isSidebarOpen = ref(true)
+const isTodoDrawerOpen = ref(false)
+const isBashShellsOpen = ref(false)
+const activeBashShells = ref<Array<{
+  bashId: string
+  status: string
+  command: string
+  description: string
+  pid: number | null
+  startedAt: number
+  endedAt: number | null
+  exitCode: number | null
+}>>([])
+let bashShellsPollTimer: ReturnType<typeof setInterval> | undefined
 const isFetchingModels = ref(false)
+const isModelMenuOpen = ref(false)
+const modelMenuSearch = ref('')
 const environmentReady = ref(false)
+const environmentInfo = ref<Record<string, string>>({})
+const currentWorkspaceCwd = ref('')
 const chatContainer = ref<HTMLElement | null>(null)
+const modelMenuRef = ref<HTMLElement | null>(null)
+const modelSearchInputRef = ref<HTMLInputElement | null>(null)
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const notice = ref<{ type: 'success' | 'error' | 'info'; text: string } | null>(null)
 const providers = ref<Provider[]>(loadProviders())
 const selectedProviderId = ref(localStorage.getItem('kuke_provider_id') || providers.value[0]?.id || 'openai')
 const selectedModel = ref(localStorage.getItem('kuke_model') || providers.value[0]?.models[0] || '')
-const systemPrompt = ref(
-  localStorage.getItem('kuke_system') ||
-    '你是一个全能的本地 AI Agent，可以调用本地工具（如读取文件、执行终端指令）。',
-)
+const systemPrompt = ref(localStorage.getItem('kuke_system') || defaultSystemPrompt)
+const systemPromptDraft = ref(systemPrompt.value)
+const appSettings = ref<AppSettings>(loadAppSettings())
+const appSettingsDraft = ref<AppSettings>(cloneAppSettings(appSettings.value))
 const sessions = ref<ChatSession[]>([])
 const currentSessionId = ref('')
+const sessionRuntimeState = ref<Record<string, SessionRuntimeState>>({})
 const debugLogs = ref<DebugLogEntry[]>([])
 const isLoadingDebugLogs = ref(false)
+const copiedMessageId = ref<string | null>(null)
+const copiedToolFieldKey = ref<string | null>(null)
+let copiedMessageResetTimer: ReturnType<typeof setTimeout> | undefined
+let copiedToolResetTimer: ReturnType<typeof setTimeout> | undefined
+
+const createAttachmentId = () => `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+
+const readFileAsDataUrl = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error ?? new Error('读取文件失败'))
+    reader.readAsDataURL(file)
+  })
+
+const getFileKind = (file: File): AttachmentKind => {
+  if (file.type.startsWith('image/')) return 'image'
+  return 'file'
+}
+
+const basenameFromPath = (value: string) => {
+  const normalized = String(value ?? '').replace(/[\\/]+$/, '')
+  const parts = normalized.split(/[\\/]/)
+  return parts[parts.length - 1] || normalized
+}
+
+const splitDiffLines = (diffText: string) => {
+  if (!diffText) return []
+  return String(diffText).split('\n')
+}
+
+const diffLineClass = (line: string) => {
+  if (!line) return 'diff-line diff-line-context'
+  const first = line.charAt(0)
+  if (first === '+') return 'diff-line diff-line-add'
+  if (first === '-') return 'diff-line diff-line-del'
+  if (first === '@' && line.startsWith('@@')) return 'diff-line diff-line-hunk'
+  return 'diff-line diff-line-context'
+}
+
+const PATH_LIKE_REGEXP = /^(?:[a-zA-Z]:[\\\/][^<>"|?*\r\n]+|\/[^<>"|?*\r\n]+|\\\\[^<>"|?*\r\n]+)$/
+
+const isPathLikeText = (text: string) => {
+  const trimmed = String(text ?? '').trim().replace(/^["']|["']$/g, '')
+  if (!trimmed || trimmed.length > 1024) {
+    return false
+  }
+  if (trimmed.includes('\n') || trimmed.includes('\r')) {
+    return false
+  }
+  return PATH_LIKE_REGEXP.test(trimmed)
+}
+
+const resolvePathLikeText = (text: string) =>
+  String(text ?? '').trim().replace(/^["']|["']$/g, '')
+
+const statPathViaLocalTools = async (candidate: string) => {
+  const stat = (window as any).localTools?.statPath
+  if (typeof stat !== 'function') {
+    return null
+  }
+  try {
+    const response = await stat(candidate)
+    if (response?.success && response.data) {
+      return response.data as { exists: boolean; path: string; isDirectory?: boolean; isFile?: boolean; size?: number }
+    }
+  } catch {
+    // ignore
+  }
+  return null
+}
+
+const addAttachment = (attachment: Attachment) => {
+  if (composerAttachments.value.some((item) => item.path === attachment.path && item.kind === attachment.kind)) {
+    return
+  }
+  composerAttachments.value = [...composerAttachments.value, attachment]
+}
+
+const removeComposerAttachment = (id: string) => {
+  composerAttachments.value = composerAttachments.value.filter((item) => item.id !== id)
+}
+
+const clearComposerAttachments = () => {
+  composerAttachments.value = []
+}
+
+const ensureMessageImagePreview = async (attachment: Attachment) => {
+  if (attachment.kind !== 'image') return
+  if (attachment.previewDataUrl) {
+    messageImagePreview.value[attachment.id] = attachment.previewDataUrl
+    return
+  }
+  if (messageImagePreview.value[attachment.id]) return
+  if (imagePreviewLoading.value.has(attachment.id)) return
+  const reader = (window as any).localTools?.readFileAsDataURL
+  if (typeof reader !== 'function' || !attachment.path) return
+  imagePreviewLoading.value.add(attachment.id)
+  try {
+    const response = await reader(attachment.path)
+    if (response?.success && response.data?.dataUrl) {
+      messageImagePreview.value[attachment.id] = response.data.dataUrl
+    }
+  } catch {
+    // ignore
+  } finally {
+    imagePreviewLoading.value.delete(attachment.id)
+  }
+}
+
+const getMessageAttachmentPreview = (attachment: Attachment) =>
+  attachment.previewDataUrl || messageImagePreview.value[attachment.id] || ''
+
+const resolveFileLocalPath = (file: File): string => {
+  const direct = String((file as any).path || '').trim()
+  if (direct) return direct
+  const resolver = (window as any).localTools?.getPathForFile
+  if (typeof resolver === 'function') {
+    try {
+      const response = resolver(file)
+      if (response?.success && response.data?.path) {
+        return String(response.data.path).trim()
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return ''
+}
+
+const addFileObjectsAsAttachments = async (files: File[]) => {
+  for (const file of files) {
+    const absolutePath = resolveFileLocalPath(file)
+    const kind = getFileKind(file)
+    let dataUrl = ''
+    try {
+      dataUrl = await readFileAsDataUrl(file)
+    } catch {
+      dataUrl = ''
+    }
+
+    if (!absolutePath) {
+      const saver = (window as any).localTools?.saveUploadedFile
+      if (!dataUrl || typeof saver !== 'function') {
+        showNotice(file.name
+          ? `无法读取 ${file.name} 的内容，请检查文件是否可访问。`
+          : '无法读取文件内容。', 'error')
+        continue
+      }
+      try {
+        const response = await saver({ dataUrl, name: file.name })
+        if (response?.success && response.data?.path) {
+          addAttachment({
+            id: createAttachmentId(),
+            kind,
+            name: file.name || basenameFromPath(response.data.path),
+            path: response.data.path,
+            size: file.size,
+            mimeType: file.type,
+            previewDataUrl: kind === 'image' ? dataUrl : undefined,
+          })
+          showNotice('该文件无法取得原始路径，已保存到临时副本，AI 对副本的改动不会同步回原文件。', 'info')
+          continue
+        }
+        showNotice(response?.error || '保存上传文件失败。', 'error')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '保存上传文件失败'
+        showNotice(message, 'error')
+      }
+      continue
+    }
+
+    addAttachment({
+      id: createAttachmentId(),
+      kind,
+      name: file.name || basenameFromPath(absolutePath),
+      path: absolutePath,
+      size: file.size,
+      mimeType: file.type,
+      previewDataUrl: kind === 'image' && dataUrl ? dataUrl : undefined,
+    })
+  }
+}
+
+const handleComposerDragOver = (event: DragEvent) => {
+  if (!event.dataTransfer) return
+  const hasFiles = Array.from(event.dataTransfer.types || []).includes('Files')
+  if (!hasFiles) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'copy'
+  isComposerDragActive.value = true
+}
+
+const handleComposerDragLeave = (event: DragEvent) => {
+  if (event.currentTarget === event.target) {
+    isComposerDragActive.value = false
+  }
+}
+
+const handleComposerDrop = async (event: DragEvent) => {
+  if (!event.dataTransfer) return
+  const items = Array.from(event.dataTransfer.items || [])
+  const files = Array.from(event.dataTransfer.files || [])
+  if (!items.length && !files.length) return
+  event.preventDefault()
+  isComposerDragActive.value = false
+
+  const folderPaths: string[] = []
+  const directFiles: File[] = []
+
+  for (const item of items) {
+    if (item.kind !== 'file') continue
+    const entry = typeof (item as any).webkitGetAsEntry === 'function' ? (item as any).webkitGetAsEntry() : null
+    const file = item.getAsFile()
+    if (entry && entry.isDirectory && file) {
+      const pathCandidate = resolveFileLocalPath(file)
+      if (pathCandidate) {
+        folderPaths.push(pathCandidate)
+        continue
+      }
+    }
+    if (file) {
+      directFiles.push(file)
+    }
+  }
+
+  if (!items.length) {
+    directFiles.push(...files)
+  }
+
+  for (const folderPath of folderPaths) {
+    addAttachment({
+      id: createAttachmentId(),
+      kind: 'folder',
+      name: basenameFromPath(folderPath),
+      path: folderPath,
+    })
+  }
+
+  if (directFiles.length) {
+    const folderSet = new Set(folderPaths)
+    const standaloneFiles = directFiles.filter((file) => {
+      const absPath = resolveFileLocalPath(file)
+      return !absPath || !folderSet.has(absPath)
+    })
+    await addFileObjectsAsAttachments(standaloneFiles)
+  }
+}
+
+const handleComposerPaste = async (event: ClipboardEvent) => {
+  const clipboardData = event.clipboardData
+  if (!clipboardData) return
+  const items = Array.from(clipboardData.items || [])
+  const imageItems = items.filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+  const stringItems = items.filter((item) => item.kind === 'string' && item.type === 'text/plain')
+
+  if (imageItems.length) {
+    event.preventDefault()
+    const files = imageItems.map((item) => item.getAsFile()).filter((file): file is File => !!file)
+    await addFileObjectsAsAttachments(files)
+    return
+  }
+
+  if (stringItems.length) {
+    const text = clipboardData.getData('text/plain')
+    if (isPathLikeText(text)) {
+      const candidate = resolvePathLikeText(text)
+      const stat = await statPathViaLocalTools(candidate)
+      if (stat?.exists) {
+        event.preventDefault()
+        addAttachment({
+          id: createAttachmentId(),
+          kind: stat.isDirectory ? 'folder' : 'file',
+          name: basenameFromPath(stat.path || candidate),
+          path: stat.path || candidate,
+          size: stat.size,
+        })
+        return
+      }
+    }
+  }
+}
+
+const handleFileInputChange = async (event: Event) => {
+  const target = event.target as HTMLInputElement | null
+  if (!target?.files?.length) return
+  const files = Array.from(target.files)
+  await addFileObjectsAsAttachments(files)
+  target.value = ''
+}
+
+const handleFolderInputChange = async (event: Event) => {
+  const target = event.target as HTMLInputElement | null
+  if (!target?.files?.length) return
+  const firstFile = target.files[0]
+  const absolutePath = resolveFileLocalPath(firstFile)
+  const relativePath = String(firstFile.webkitRelativePath || '').trim()
+  if (absolutePath && relativePath) {
+    const separator = absolutePath.includes('\\') ? '\\' : '/'
+    const rootLength = absolutePath.length - relativePath.length - separator.length
+    const rootPath = rootLength > 0 ? absolutePath.slice(0, rootLength) : absolutePath
+    addAttachment({
+      id: createAttachmentId(),
+      kind: 'folder',
+      name: basenameFromPath(rootPath) || rootPath,
+      path: rootPath,
+    })
+  } else if (absolutePath) {
+    const fallbackParent = absolutePath.replace(/[\\/][^\\/]*$/, '')
+    addAttachment({
+      id: createAttachmentId(),
+      kind: 'folder',
+      name: basenameFromPath(fallbackParent) || fallbackParent,
+      path: fallbackParent || absolutePath,
+    })
+  } else {
+    showNotice('当前环境下无法获取文件夹本地路径（Electron 已禁用 File.path 时，需要宿主暴露 webUtils.getPathForFile）。', 'error')
+  }
+  target.value = ''
+}
+
+const handleImageInputChange = async (event: Event) => {
+  const target = event.target as HTMLInputElement | null
+  if (!target?.files?.length) return
+  const files = Array.from(target.files).filter((file) => file.type.startsWith('image/'))
+  await addFileObjectsAsAttachments(files)
+  target.value = ''
+}
+
+const triggerFileInput = () => {
+  isPlusMenuOpen.value = false
+  fileInputRef.value?.click()
+}
+
+const triggerFolderInput = () => {
+  isPlusMenuOpen.value = false
+  folderInputRef.value?.click()
+}
+
+const triggerImageInput = () => {
+  imageInputRef.value?.click()
+}
+
+const getAttachmentLabel = (kind: AttachmentKind) =>
+  ({ image: '图片', file: '文件', folder: '文件夹' })[kind]
+
+const formatBytes = (value?: number) => {
+  if (!value || value <= 0) return ''
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+const buildAttachmentNoteText = (attachments: Attachment[]) => {
+  const nonImage = attachments.filter((item) => item.kind !== 'image' && item.path)
+  const images = attachments.filter((item) => item.kind === 'image')
+  const lines: string[] = []
+  if (nonImage.length) {
+    lines.push('附件：')
+    for (const attachment of nonImage) {
+      const tag = attachment.kind === 'folder' ? '文件夹' : '文件'
+      lines.push(`- ${tag}：\`${attachment.path}\``)
+    }
+  }
+  if (images.length) {
+    if (!nonImage.length) {
+      lines.push('附件：')
+    }
+    for (const attachment of images) {
+      const pathHint = attachment.path ? `（本地缓存：\`${attachment.path}\`）` : ''
+      lines.push(`- 图片：${attachment.name || '粘贴图片'}${pathHint}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+
+const copyTextToClipboard = async (text: string) => {
+  const value = String(text ?? '')
+  if (!value) {
+    return false
+  }
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value)
+      return true
+    }
+  } catch {
+    // fall through to legacy path
+  }
+  try {
+    if (typeof document === 'undefined') {
+      return false
+    }
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.top = '0'
+    textarea.style.left = '0'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
+}
 
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -198,70 +1618,235 @@ const activeSession = computed(
   () => sessions.value.find((session) => session.id === currentSessionId.value) || null,
 )
 const hasMessages = computed(() => messages.value.length > 0)
+const isCurrentSessionLoading = computed(() => {
+  if (!currentSessionId.value) {
+    return false
+  }
+  return ensureSessionRuntime(currentSessionId.value).isLoading
+})
 const headerTitle = computed(() => (!isSidebarOpen.value && activeSession.value ? activeSession.value.title : 'Kuke Agent'))
 const headerTitleKey = computed(() => (!isSidebarOpen.value && activeSession.value ? activeSession.value.id : 'brand'))
-const debugLogItems = computed(() => [...debugLogs.value].reverse())
 
-const tools = [
-  {
-    type: 'function',
-    function: {
-      name: 'readDir',
-      description: '读取本地目录下的所有文件和文件夹列表',
-      parameters: {
-        type: 'object',
-        properties: {
-          dirPath: { type: 'string', description: '目录的绝对路径或相对路径' },
-        },
-        required: ['dirPath'],
+const currentSessionTodos = computed<TodoItem[]>(() => {
+  const sessionId = currentSessionId.value
+  if (!sessionId) return []
+  const runtime = sessionRuntimeState.value[sessionId]
+  return runtime?.todos ?? []
+})
+
+const currentTodoStats = computed(() => {
+  const stats = { total: 0, pending: 0, in_progress: 0, completed: 0 }
+  for (const todo of currentSessionTodos.value) {
+    stats.total += 1
+    stats[todo.status] += 1
+  }
+  return stats
+})
+
+const hasCurrentTodos = computed(() => currentSessionTodos.value.length > 0)
+
+const activeBashCount = computed(() =>
+  activeBashShells.value.filter((item) => item.status === 'running').length,
+)
+
+const refreshActiveBashShells = () => {
+  const lister = (window as any).localTools?.listBackgroundBashes
+  if (typeof lister !== 'function') return
+  try {
+    const response = lister()
+    if (response?.success && Array.isArray(response?.data?.shells)) {
+      activeBashShells.value = response.data.shells
+    }
+  } catch {
+    // ignore polling errors
+  }
+}
+
+const killBackgroundBashShell = async (bashId: string) => {
+  const killer = (window as any).localTools?.KillShellTool
+  if (typeof killer !== 'function') return
+  try {
+    await killer({ bashId })
+    refreshActiveBashShells()
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '终止失败', 'error')
+  }
+}
+
+const toggleTodoDrawer = () => {
+  isTodoDrawerOpen.value = !isTodoDrawerOpen.value
+}
+
+const toggleBashShellsPanel = () => {
+  isBashShellsOpen.value = !isBashShellsOpen.value
+  if (isBashShellsOpen.value) {
+    refreshActiveBashShells()
+  }
+}
+const debugLogItems = computed(() => [...debugLogs.value].reverse())
+const effectiveSystemPromptDraft = computed(() => systemPromptDraft.value.trim() || defaultSystemPrompt)
+const hasSystemPromptDraftChanges = computed(() => effectiveSystemPromptDraft.value !== systemPrompt.value)
+const systemPromptDraftLength = computed(() => effectiveSystemPromptDraft.value.length)
+const activeSessionPromptSnapshot = computed(() => activeSession.value?.systemPromptSnapshot?.trim() || '')
+const selectedModelLabel = computed(() => selectedModel.value || '选择模型')
+const filteredModelGroups = computed(() => {
+  const keyword = modelMenuSearch.value.trim().toLowerCase()
+  return providers.value
+    .map((provider) => {
+      const providerName = provider.name.toLowerCase()
+      const providerUrl = provider.baseURL.toLowerCase()
+      const matchedModels = keyword
+        ? provider.models.filter((model) => {
+            const normalizedModel = model.toLowerCase()
+            return normalizedModel.includes(keyword) || providerName.includes(keyword) || providerUrl.includes(keyword)
+          })
+        : provider.models
+
+      return {
+        ...provider,
+        matchedModels,
+      }
+    })
+    .filter((provider) => provider.matchedModels.length > 0)
+})
+const hasFilteredModelOptions = computed(() => filteredModelGroups.value.length > 0)
+
+const toolSettingsSummary = computed(() => (
+  appSettings.value.enableLocalTools
+    ? `已启用 ${appSettings.value.enabledToolNames.length}/${toolCatalog.length} 个工具`
+    : '本地工具已关闭'
+))
+const hasTavilyKeyConfigured = computed(() => Boolean(appSettingsDraft.value.tavilyApiKey.trim()))
+const draftEnabledToolCount = computed(() => appSettingsDraft.value.enabledToolNames.length)
+const draftDisabledToolCount = computed(() => toolCatalog.length - draftEnabledToolCount.value)
+const toolCatalogGroups = computed(() => (
+  toolCategories.map((category) => {
+    const tools = toolCatalog.filter((tool) => tool.category === category.id)
+    const enabledCount = tools.filter((tool) => appSettingsDraft.value.enabledToolNames.includes(tool.name)).length
+    return {
+      ...category,
+      tools,
+      enabledCount,
+    }
+  })
+))
+const enabledTools = computed(() => (
+  toolCatalog
+    .filter((tool) => appSettings.value.enabledToolNames.includes(tool.name))
+    .map((tool) => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
       },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'readFile',
-      description: '读取本地文件的内容',
-      parameters: {
-        type: 'object',
-        properties: {
-          filePath: { type: 'string', description: '文件的绝对路径或相对路径' },
-        },
-        required: ['filePath'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'writeFile',
-      description: '向本地文件写入内容',
-      parameters: {
-        type: 'object',
-        properties: {
-          filePath: { type: 'string', description: '文件的绝对路径或相对路径' },
-          content: { type: 'string', description: '要写入的文件内容' },
-        },
-        required: ['filePath', 'content'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'execCommand',
-      description: '在终端执行系统指令，如 npm install、dir 等',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: '要执行的终端指令' },
-          cwd: { type: 'string', description: '执行指令的当前工作目录（可选）' },
-        },
-        required: ['command'],
-      },
-    },
-  },
-]
+    }))
+))
+
+const getToolDefinition = (toolName: string) => toolCatalogMap.get(toolName) || null
+
+const getToolDisplayName = (toolName: string) => getToolDefinition(toolName)?.label || toolName || '等待工具名称'
+
+const getToolDisplayPurpose = (toolName: string) => getToolDefinition(toolName)?.purpose || ''
+
+const isToolEnabled = (toolName: string, source: AppSettings) => source.enabledToolNames.includes(toolName)
+
+const toggleToolDraft = (toolName: string) => {
+  const currentSet = new Set(appSettingsDraft.value.enabledToolNames)
+  if (currentSet.has(toolName)) {
+    currentSet.delete(toolName)
+  } else {
+    currentSet.add(toolName)
+  }
+  appSettingsDraft.value.enabledToolNames = toolCatalog
+    .map((tool) => tool.name)
+    .filter((name) => currentSet.has(name))
+}
+
+const toggleToolCategoryDraft = (categoryId: ToolCategoryId) => {
+  const categoryTools = toolCatalog.filter((tool) => tool.category === categoryId).map((tool) => tool.name)
+  const enabledSet = new Set(appSettingsDraft.value.enabledToolNames)
+  const shouldEnableAll = categoryTools.some((toolName) => !enabledSet.has(toolName))
+
+  categoryTools.forEach((toolName) => {
+    if (shouldEnableAll) {
+      enabledSet.add(toolName)
+    } else {
+      enabledSet.delete(toolName)
+    }
+  })
+
+  appSettingsDraft.value.enabledToolNames = toolCatalog
+    .map((tool) => tool.name)
+    .filter((name) => enabledSet.has(name))
+}
+
+const setAllToolDraftEnabled = (enabled: boolean) => {
+  appSettingsDraft.value.enabledToolNames = enabled ? getDefaultEnabledToolNames() : []
+}
+
+const resetToolDraftSelection = () => {
+  appSettingsDraft.value.enabledToolNames = getDefaultEnabledToolNames()
+}
+
+const clearWorkspaceRootDraft = () => {
+  appSettingsDraft.value.workspaceRoot = ''
+}
+
+const toggleAllowlistToolDraft = (toolName: string) => {
+  const canonical = toolCatalogMap.get(toolName)?.name ?? toolName
+  const set = new Set(appSettingsDraft.value.toolListNames)
+  if (set.has(canonical)) {
+    set.delete(canonical)
+  } else {
+    set.add(canonical)
+  }
+  appSettingsDraft.value.toolListNames = toolCatalog
+    .map((tool) => tool.name)
+    .filter((name) => set.has(name))
+}
+
+const handleCommandListInput = (raw: string) => {
+  const lines = String(raw ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line, index, arr) => line && arr.indexOf(line) === index)
+  appSettingsDraft.value.commandListPatterns = lines.slice(0, 256)
+}
+
+const hasWorkspaceDraftChanged = computed(
+  () => appSettingsDraft.value.workspaceRoot !== appSettings.value.workspaceRoot,
+)
+
+const applyWorkspaceRootFromSettings = async () => {
+  const target = appSettings.value.workspaceRoot.trim()
+  const setter = (window as any).localTools?.setWorkspaceRoot
+  const getter = (window as any).localTools?.getWorkspaceRoot
+  if (typeof setter === 'function') {
+    try {
+      // Pass target (may be empty) — setter will use default workspace if target is empty/undefined
+      const response = await setter(target || undefined)
+      if (response?.success && response.data?.cwd) {
+        currentWorkspaceCwd.value = response.data.cwd
+      } else if (response?.error) {
+        showNotice(`应用工作目录失败：${response.error}`, 'error')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '应用工作目录失败'
+      showNotice(message, 'error')
+    }
+  }
+  if (typeof getter === 'function') {
+    try {
+      const response = await getter()
+      if (response?.success && response.data?.cwd) {
+        currentWorkspaceCwd.value = response.data.cwd
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
 
 const showNotice = (text: string, type: 'success' | 'error' | 'info' = 'info') => {
   notice.value = { text, type }
@@ -297,18 +1882,196 @@ const persistConfig = () => {
   localStorage.setItem('kuke_provider_id', selectedProviderId.value)
   localStorage.setItem('kuke_model', selectedModel.value)
   localStorage.setItem('kuke_system', systemPrompt.value)
+  localStorage.setItem('kuke_settings', JSON.stringify(appSettings.value))
+}
+
+const openSettings = (tab = activeSettingsTab.value) => {
+  activeSettingsTab.value = tab
+  systemPromptDraft.value = systemPrompt.value
+  appSettingsDraft.value = cloneAppSettings(appSettings.value)
+  isModelMenuOpen.value = false
+  showSettings.value = true
+}
+
+const closeSettings = () => {
+  systemPromptDraft.value = systemPrompt.value
+  appSettingsDraft.value = cloneAppSettings(appSettings.value)
+  showSettings.value = false
+}
+
+const resetSystemPromptDraft = () => {
+  systemPromptDraft.value = defaultSystemPrompt
+}
+
+const applySystemPromptPreset = (prompt: string) => {
+  systemPromptDraft.value = prompt
+}
+
+const applyModelSelection = (
+  rawValue: string,
+  options: {
+    persist?: boolean
+    notice?: boolean
+  } = {},
+) => {
+  const { persist = false, notice = false } = options
+
+  try {
+    const parsed = JSON.parse(rawValue) as { providerId?: string; model?: string }
+    const providerId = String(parsed.providerId ?? '')
+    const model = String(parsed.model ?? '')
+    const provider = providers.value.find((item) => item.id === providerId)
+
+    if (!provider) {
+      return
+    }
+
+    selectedProviderId.value = provider.id
+    selectedModel.value = provider.models.includes(model) ? model : (provider.models[0] || '')
+    ensureProviderSelection()
+
+    if (persist) {
+      persistConfig()
+    }
+
+    if (notice) {
+      showNotice(`已切换到 ${provider.name} / ${selectedModel.value}`, 'success')
+    }
+  } catch {
+    showNotice('模型切换失败，请重新选择。', 'error')
+  }
+}
+
+const toggleModelMenu = () => {
+  isModelMenuOpen.value = !isModelMenuOpen.value
+}
+
+const selectHeaderModel = (providerId: string, model: string) => {
+  if (providerId === selectedProviderId.value && model === selectedModel.value) {
+    isModelMenuOpen.value = false
+    return
+  }
+
+  applyModelSelection(JSON.stringify({ providerId, model }), { persist: true, notice: true })
+  isModelMenuOpen.value = false
+}
+
+const ensureSessionSystemPrompt = (sessionId: string) => {
+  const session = getSessionById(sessionId)
+  if (!session) {
+    return systemPrompt.value
+  }
+
+  if (!session.systemPromptSnapshot?.trim()) {
+    session.systemPromptSnapshot = systemPrompt.value.trim() || defaultSystemPrompt
+    saveSessionsToStorage()
+  }
+
+  return session.systemPromptSnapshot
+}
+
+const pad2 = (value: number) => String(value).padStart(2, '0')
+
+const buildPlaceholderValues = (): Record<string, string> => {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = pad2(now.getMonth() + 1)
+  const day = pad2(now.getDate())
+  const hour = pad2(now.getHours())
+  const minute = pad2(now.getMinutes())
+  const second = pad2(now.getSeconds())
+  const currentDate = `${year}-${month}-${day}`
+  const currentTime = `${currentDate} ${hour}:${minute}:${second}`
+  let browserTimezone = ''
+  try {
+    browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+  } catch {
+    browserTimezone = ''
+  }
+  const env = environmentInfo.value
+  const resolve = (key: string, fallback = '') => {
+    const value = env[key]
+    return typeof value === 'string' && value.trim() ? value : fallback
+  }
+  return {
+    currentTime,
+    current_time: currentTime,
+    currentDate,
+    current_date: currentDate,
+    currentYear: String(year),
+    weekday: now.toLocaleDateString(undefined, { weekday: 'long' }),
+    timezone: resolve('timezone', browserTimezone),
+    locale: resolve('locale', typeof navigator !== 'undefined' ? navigator.language || '' : ''),
+    platform: resolve('platform'),
+    os: resolve('osType', resolve('platform')),
+    osType: resolve('osType'),
+    osRelease: resolve('osRelease'),
+    arch: resolve('arch'),
+    cwd: resolve('cwd'),
+    workingDirectory: resolve('cwd'),
+    homedir: resolve('homedir'),
+    hostname: resolve('hostname'),
+    user: resolve('user'),
+    username: resolve('user'),
+    nodeVersion: resolve('nodeVersion'),
+  }
+}
+
+const resolveSystemPromptPlaceholders = (raw: string): string => {
+  if (!raw) {
+    return raw
+  }
+  const values = buildPlaceholderValues()
+  return raw.replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (match, key: string) => {
+    if (Object.prototype.hasOwnProperty.call(values, key)) {
+      const value = values[key]
+      return value ? value : match
+    }
+    return match
+  })
 }
 
 const saveConfig = () => {
   ensureProviderSelection()
+  systemPrompt.value = effectiveSystemPromptDraft.value
+  appSettings.value = normalizeAppSettings(appSettingsDraft.value)
   persistConfig()
+  systemPromptDraft.value = systemPrompt.value
+  appSettingsDraft.value = cloneAppSettings(appSettings.value)
   showSettings.value = false
-  showNotice('模型配置已保存并应用。', 'success')
+  showNotice('配置已保存，新对话会使用当前系统提示词、工具清单与交互设置。', 'success')
+  void applyWorkspaceRootFromSettings()
 }
 
 const focusComposer = () => {
   nextTick(() => {
     textareaRef.value?.focus()
+  })
+}
+
+let launchPayloadUnsubscribe: (() => void) | null = null
+
+const handleLaunchPayload = (payload: string) => {
+  const query = typeof payload === 'string' ? payload.trim() : ''
+  if (!query) {
+    return
+  }
+  const current = activeSession.value
+  const currentRuntime = current ? ensureSessionRuntime(current.id) : null
+  const canReuseCurrent = Boolean(
+    current && current.messages.length === 0 && !currentRuntime?.isLoading,
+  )
+  if (!canReuseCurrent) {
+    createNewSession()
+  }
+  const autoSend = appSettings.value.launchAutoSend
+  nextTick(() => {
+    input.value = query
+    if (autoSend) {
+      void sendMessage()
+    } else {
+      focusComposer()
+    }
   })
 }
 
@@ -322,7 +2085,142 @@ const scrollToBottom = () => {
 
 const renderMarkdown = (content: string) => md.render(content)
 
+const canCopyMessage = (message: ChatMessage) => {
+  if (message.role === 'tool') {
+    return false
+  }
+  return Boolean(String(message.content ?? '').trim())
+}
+
+const copyMessageText = async (message: ChatMessage) => {
+  const value = String(message.content ?? '').trim()
+  if (!value) {
+    return
+  }
+  const ok = await copyTextToClipboard(value)
+  if (!ok) {
+    showNotice('复制失败，请手动选择文本复制。', 'error')
+    return
+  }
+  copiedMessageId.value = message.id
+  if (copiedMessageResetTimer) {
+    clearTimeout(copiedMessageResetTimer)
+  }
+  copiedMessageResetTimer = setTimeout(() => {
+    if (copiedMessageId.value === message.id) {
+      copiedMessageId.value = null
+    }
+  }, 1800)
+}
+
+const copyToolField = async (blockId: string, field: 'arguments' | 'result', value: string) => {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    return
+  }
+  const ok = await copyTextToClipboard(text)
+  if (!ok) {
+    showNotice('复制失败，请手动选择文本复制。', 'error')
+    return
+  }
+  const key = `${blockId}:${field}`
+  copiedToolFieldKey.value = key
+  if (copiedToolResetTimer) {
+    clearTimeout(copiedToolResetTimer)
+  }
+  copiedToolResetTimer = setTimeout(() => {
+    if (copiedToolFieldKey.value === key) {
+      copiedToolFieldKey.value = null
+    }
+  }, 1800)
+}
+
+const isToolFieldCopied = (blockId: string, field: 'arguments' | 'result') =>
+  copiedToolFieldKey.value === `${blockId}:${field}`
+
+const handleDocumentCopyClick = (event: MouseEvent) => {
+  const target = event.target
+  if (!(target instanceof Element)) {
+    return
+  }
+  const copyBtn = target.closest('.md-code-copy') as HTMLButtonElement | null
+  if (!copyBtn) {
+    return
+  }
+  event.preventDefault()
+  event.stopPropagation()
+  const encoded = copyBtn.dataset.code ?? ''
+  let text = ''
+  try {
+    text = decodeURIComponent(encoded)
+  } catch {
+    text = ''
+  }
+  if (!text) {
+    return
+  }
+  void copyTextToClipboard(text).then((success) => {
+    if (!success) {
+      showNotice('复制失败，请手动选择文本复制。', 'error')
+      return
+    }
+    const label = copyBtn.querySelector('.md-code-copy-label') as HTMLElement | null
+    copyBtn.classList.add('is-copied')
+    if (label) {
+      label.textContent = '已复制'
+    }
+    setTimeout(() => {
+      copyBtn.classList.remove('is-copied')
+      if (label) {
+        label.textContent = '复制'
+      }
+    }, 1800)
+  })
+}
+
+const runToolWithCancel = <T,>(sessionId: string, toolPromise: Promise<T>): Promise<T | { success: false; aborted: true; error: string }> => {
+  const runtime = sessionRuntimeState.value[sessionId]
+  if (runtime?.stopRequested) {
+    return Promise.resolve({ success: false, aborted: true, error: '用户已中断本轮工具执行。' })
+  }
+  let unwatchStop: (() => void) | null = null
+  const abortPromise = new Promise<{ success: false; aborted: true; error: string }>((resolve) => {
+    unwatchStop = watch(
+      () => sessionRuntimeState.value[sessionId]?.stopRequested,
+      (stopRequested) => {
+        if (stopRequested) {
+          resolve({ success: false, aborted: true, error: '用户已中断本轮工具执行。' })
+        }
+      },
+    )
+  })
+  return Promise.race([toolPromise, abortPromise]).finally(() => {
+    if (unwatchStop) {
+      unwatchStop()
+    }
+  })
+}
+
+const isAbortedToolResult = (value: unknown): value is { success: false; aborted: true; error: string } =>
+  typeof value === 'object' && value !== null
+  && (value as { success?: unknown }).success === false
+  && (value as { aborted?: unknown }).aborted === true
+
 const hasRenderableContent = (content: string) => Boolean(content.trim())
+
+const shouldShowAssistantStreamPlaceholder = (message: ChatMessage) => {
+  if (message.role !== 'assistant' || !message.isStreaming) {
+    return false
+  }
+
+  const blocks = message.blocks ?? []
+  if (!blocks.length) {
+    return true
+  }
+
+  const lastBlock = blocks[blocks.length - 1]
+  return lastBlock.type === 'tool' || !hasRenderableContent(lastBlock.content)
+}
 
 const getToolArgumentsPlaceholder = (tool: ToolInvocation) =>
   tool.status === 'draft' ? '参数正在生成中…' : '当前没有可展示的工具参数。'
@@ -342,6 +2240,89 @@ const tryParseJson = (value: string) => {
   } catch {
     return null
   }
+}
+
+const hasOwnKey = (target: Record<string, unknown>, key: string) =>
+  Object.prototype.hasOwnProperty.call(target, key)
+
+const getArgumentByAliases = (parsedArguments: Record<string, unknown>, aliases: string[]) => {
+  for (const alias of aliases) {
+    if (hasOwnKey(parsedArguments, alias)) {
+      const value = parsedArguments[alias]
+      if (value !== undefined && value !== null) {
+        return value
+      }
+    }
+  }
+  return undefined
+}
+
+const stringifyArgument = (value: unknown) => (value === undefined ? '' : String(value))
+
+const cloneMessages = (messageList: ChatMessage[]) =>
+  messageList.map((message) => ({
+    ...message,
+    toolInvocations: message.toolInvocations.map((tool) => cloneToolInvocation(tool)),
+    blocks: cloneMessageBlocks(message.blocks ?? []),
+    attachments: cloneAttachments(message.attachments),
+  }))
+
+const getSessionById = (sessionId: string) =>
+  sessions.value.find((session) => session.id === sessionId) || null
+
+const ensureSessionRuntime = (sessionId: string): SessionRuntimeState => {
+  if (!sessionRuntimeState.value[sessionId]) {
+    sessionRuntimeState.value[sessionId] = {
+      isLoading: false,
+      activeRequestId: null,
+      stopRequested: false,
+      todos: [],
+      todosUpdatedAt: 0,
+    }
+  }
+  return sessionRuntimeState.value[sessionId]
+}
+
+const applySessionTodos = (sessionId: string, todos: TodoItem[]) => {
+  const runtime = ensureSessionRuntime(sessionId)
+  runtime.todos = Array.isArray(todos)
+    ? todos.map((item) => ({
+        content: String(item?.content ?? '').trim(),
+        activeForm: String(item?.activeForm ?? item?.content ?? '').trim(),
+        status: (['pending', 'in_progress', 'completed'] as const).includes(item?.status as TodoStatus)
+          ? (item.status as TodoStatus)
+          : 'pending',
+      }))
+    : []
+  runtime.todosUpdatedAt = Date.now()
+}
+
+const syncActiveMessagesFromSession = (sessionId: string) => {
+  if (currentSessionId.value !== sessionId) {
+    return
+  }
+  const session = getSessionById(sessionId)
+  messages.value = session ? cloneMessages(session.messages) : []
+}
+
+const mutateSessionMessages = (
+  sessionId: string,
+  updater: (messageList: ChatMessage[]) => void,
+) => {
+  const session = getSessionById(sessionId)
+  if (!session) {
+    return
+  }
+  const nextMessages = cloneMessages(session.messages)
+  updater(nextMessages)
+  session.messages = nextMessages
+  syncActiveMessagesFromSession(sessionId)
+}
+
+const appendSessionMessage = (sessionId: string, message: ChatMessage) => {
+  mutateSessionMessages(sessionId, (messageList) => {
+    messageList.push(message)
+  })
 }
 
 const loadDebugLogs = async () => {
@@ -372,7 +2353,325 @@ const clearDebugLogs = async () => {
   showNotice('调试日志已清空。', 'success')
 }
 
-const executeLocalTool = async (functionName: string, parsedArguments: Record<string, unknown>, availableTool: any) => {
+const maybeLoadDebugLogs = async (force = false) => {
+  if (!force && !appSettings.value.autoRefreshDebugLogs && activeSettingsTab.value !== 'debug') {
+    return
+  }
+  await loadDebugLogs()
+}
+
+const handleDocumentPointerDown = (event: MouseEvent) => {
+  const target = event.target
+  if (!(target instanceof Node)) {
+    return
+  }
+
+  if (isModelMenuOpen.value && modelMenuRef.value && !modelMenuRef.value.contains(target)) {
+    isModelMenuOpen.value = false
+  }
+
+  if (isPlusMenuOpen.value && plusMenuRef.value && !plusMenuRef.value.contains(target)) {
+    isPlusMenuOpen.value = false
+  }
+}
+
+const handleGlobalKeydown = (event: KeyboardEvent) => {
+  if (event.key !== 'Escape') {
+    return
+  }
+
+  if (isPlusMenuOpen.value) {
+    isPlusMenuOpen.value = false
+  }
+
+  if (isModelMenuOpen.value) {
+    isModelMenuOpen.value = false
+    return
+  }
+
+  if (showSettings.value) {
+    closeSettings()
+  }
+}
+
+watch(isModelMenuOpen, (open) => {
+  if (!open) {
+    modelMenuSearch.value = ''
+    return
+  }
+  nextTick(() => {
+    modelSearchInputRef.value?.focus()
+  })
+})
+
+watch(messages, (list) => {
+  for (const message of list) {
+    if (!Array.isArray(message.attachments)) continue
+    for (const attachment of message.attachments) {
+      if (attachment.kind === 'image') {
+        void ensureMessageImagePreview(attachment)
+      }
+    }
+  }
+}, { deep: true })
+
+const handleComposerKeydown = (event: KeyboardEvent) => {
+  if (event.key !== 'Enter' || event.isComposing) {
+    return
+  }
+
+  const shouldSend = appSettings.value.composerSendMode === 'enter'
+    ? !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+    : (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey
+
+  if (!shouldSend) {
+    return
+  }
+
+  event.preventDefault()
+  if (isCurrentSessionLoading.value) {
+    void stopCurrentSessionRequest()
+    return
+  }
+
+  void sendMessage()
+}
+
+const FILE_MUTATING_TOOLS = new Set(['FileEditTool', 'FileWriteTool', 'FileDeleteTool', 'writeFile', 'NotebookEditTool'])
+const MUTATING_TOOL_NAMES = new Set(['BashTool', 'execCommand', 'FileEditTool', 'FileWriteTool', 'FileDeleteTool', 'writeFile', 'NotebookEditTool', 'KillShellTool', 'SetWorkspaceRootTool'])
+
+type ToolConfirmationDecision = 'allow_once' | 'allow_always' | 'allow_and_remember' | 'deny'
+
+interface PendingToolConfirmation {
+  id: string
+  toolName: string
+  toolLabel: string
+  toolPurpose: string
+  args: Record<string, unknown>
+  argsPreview: string
+  riskLevel: ToolRiskLevel
+  riskReason: string
+  sessionId: string
+  allowlistAction?: 'add_to_white' | 'remove_from_black'
+  bashCommand?: string
+  resolve: (decision: ToolConfirmationDecision) => void
+}
+
+const pendingConfirmation = ref<PendingToolConfirmation | null>(null)
+const sessionAlwaysAllow = ref<Record<string, Set<string>>>({})
+
+const normalizeRiskLevel = (value: unknown): ToolRiskLevel => {
+  const raw = String(value ?? '').toLowerCase().trim()
+  if (raw === 'high' || raw === 'medium' || raw === 'low') return raw
+  return 'medium'
+}
+
+const riskLevelRank: Record<ToolRiskLevel, number> = { low: 0, medium: 1, high: 2 }
+
+const getCanonicalToolName = (toolName: string) => {
+  if (toolName === 'execCommand') return 'BashTool'
+  if (toolName === 'writeFile') return 'FileWriteTool'
+  if (toolName === 'readFile') return 'FileReadTool'
+  if (toolName === 'readDir') return 'GlobTool'
+  return toolName
+}
+
+type ToolGateDecision =
+  | { kind: 'allow' }
+  | { kind: 'deny'; reason: string }
+  | {
+      kind: 'confirm'
+      allowlistAction?: 'add_to_white' | 'remove_from_black'
+      bashCommand?: string
+    }
+
+const escapeRegExpForGlob = (value: string) => value.replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+
+const matchCommandPattern = (command: string, rawPattern: string): boolean => {
+  const normalized = String(command ?? '').trim()
+  const pattern = String(rawPattern ?? '').trim()
+  if (!pattern) return false
+  if (pattern.includes('*')) {
+    try {
+      const regex = new RegExp(`^${escapeRegExpForGlob(pattern).replace(/\\\*/g, '.*')}$`)
+      return regex.test(normalized)
+    } catch {
+      return false
+    }
+  }
+  return normalized === pattern || normalized.startsWith(`${pattern} `)
+}
+
+const anyCommandPatternMatches = (command: string, patterns: string[]) =>
+  patterns.some((pattern) => matchCommandPattern(command, pattern))
+
+const decideToolGate = (
+  toolName: string,
+  parsedArguments: Record<string, unknown>,
+  riskLevel: ToolRiskLevel,
+  mode: SafetyMode,
+  sessionId: string,
+): ToolGateDecision => {
+  if (mode === 'loose') return { kind: 'allow' }
+
+  const canonical = getCanonicalToolName(toolName)
+
+  if (mode === 'allowlist') {
+    if (sessionAlwaysAllow.value[sessionId]?.has(canonical)) return { kind: 'allow' }
+
+    const inToolList = appSettings.value.toolListNames.includes(canonical)
+    const toolKind = appSettings.value.toolListKind
+    const toolNeedsConfirm = toolKind === 'white' ? !inToolList : inToolList
+    if (toolNeedsConfirm) {
+      return { kind: 'confirm' }
+    }
+
+    if (canonical === 'BashTool') {
+      const rawCommand = String((parsedArguments as any)?.command ?? '').trim()
+      const patterns = appSettings.value.commandListPatterns
+      const cmdInList = rawCommand ? anyCommandPatternMatches(rawCommand, patterns) : false
+      const cmdKind = appSettings.value.commandListKind
+      const cmdNeedsConfirm = cmdKind === 'white' ? !cmdInList : cmdInList
+      if (cmdNeedsConfirm) {
+        return {
+          kind: 'confirm',
+          allowlistAction: cmdKind === 'white' ? 'add_to_white' : 'remove_from_black',
+          bashCommand: rawCommand,
+        }
+      }
+    }
+
+    return { kind: 'allow' }
+  }
+
+  if (!MUTATING_TOOL_NAMES.has(toolName)) return { kind: 'allow' }
+  if (sessionAlwaysAllow.value[sessionId]?.has(canonical)) return { kind: 'allow' }
+
+  if (mode === 'strict') return { kind: 'confirm' }
+
+  const threshold = appSettings.value.moderateOnlyHigh ? riskLevelRank.high : riskLevelRank.medium
+  return riskLevelRank[riskLevel] >= threshold ? { kind: 'confirm' } : { kind: 'allow' }
+}
+
+const requestToolConfirmation = (
+  toolName: string,
+  args: Record<string, unknown>,
+  riskLevel: ToolRiskLevel,
+  riskReason: string,
+  sessionId: string,
+  extras: { allowlistAction?: 'add_to_white' | 'remove_from_black'; bashCommand?: string } = {},
+): Promise<ToolConfirmationDecision> => {
+  const toolDef = getToolDefinition(toolName)
+  const displayArgs: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(args || {})) {
+    if (key === '__context' || key === 'riskLevel' || key === 'riskReason') continue
+    displayArgs[key] = value
+  }
+  let argsPreview = ''
+  try {
+    argsPreview = JSON.stringify(displayArgs, null, 2)
+  } catch {
+    argsPreview = String(displayArgs)
+  }
+  return new Promise((resolve) => {
+    pendingConfirmation.value = {
+      id: `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      toolName,
+      toolLabel: toolDef?.label || toolName,
+      toolPurpose: toolDef?.purpose || '',
+      args: displayArgs,
+      argsPreview,
+      riskLevel,
+      riskReason,
+      sessionId,
+      allowlistAction: extras.allowlistAction,
+      bashCommand: extras.bashCommand,
+      resolve,
+    }
+  })
+}
+
+const applyAllowlistRemember = (pending: PendingToolConfirmation) => {
+  const command = String(pending.bashCommand ?? '').trim()
+  if (!command || !pending.allowlistAction) return
+  const currentPatterns = [...appSettings.value.commandListPatterns]
+  if (pending.allowlistAction === 'add_to_white') {
+    if (!currentPatterns.includes(command)) {
+      currentPatterns.push(command)
+      const next = { ...appSettings.value, commandListPatterns: currentPatterns }
+      appSettings.value = next
+      appSettingsDraft.value = { ...appSettingsDraft.value, commandListPatterns: currentPatterns }
+      persistConfig()
+      showNotice(`已加入白名单：\`${command}\``, 'success')
+    }
+  } else if (pending.allowlistAction === 'remove_from_black') {
+    const filtered = currentPatterns.filter((pattern) => !matchCommandPattern(command, pattern))
+    if (filtered.length !== currentPatterns.length) {
+      const next = { ...appSettings.value, commandListPatterns: filtered }
+      appSettings.value = next
+      appSettingsDraft.value = { ...appSettingsDraft.value, commandListPatterns: filtered }
+      persistConfig()
+      showNotice(`已从黑名单移除：\`${command}\``, 'success')
+    }
+  }
+}
+
+const resolvePendingConfirmation = (decision: ToolConfirmationDecision) => {
+  const pending = pendingConfirmation.value
+  if (!pending) return
+  if (decision === 'allow_always') {
+    const canonical = getCanonicalToolName(pending.toolName)
+    const existing = sessionAlwaysAllow.value[pending.sessionId] ?? new Set<string>()
+    existing.add(canonical)
+    sessionAlwaysAllow.value = {
+      ...sessionAlwaysAllow.value,
+      [pending.sessionId]: existing,
+    }
+  }
+  if (decision === 'allow_and_remember') {
+    applyAllowlistRemember(pending)
+  }
+  pendingConfirmation.value = null
+  pending.resolve(decision)
+}
+
+const getRiskLevelLabel = (risk: ToolRiskLevel) =>
+  ({ low: '低风险', medium: '中风险', high: '高风险' })[risk]
+
+const getSafetyModeLabel = (mode: SafetyMode) =>
+  ({
+    strict: '严格模式',
+    moderate: '宽松模式',
+    loose: '无视风险',
+    allowlist: '黑白名单',
+  })[mode]
+
+const tryPrepareSnapshot = async (
+  context: { sessionId: string; messageId: string } | null,
+  filePath: unknown,
+) => {
+  if (!context) return
+  const path = typeof filePath === 'string' ? filePath.trim() : ''
+  if (!path) return
+  const snapshotFile = (window as any).localTools?.snapshotFile
+  if (typeof snapshotFile !== 'function') return
+  try {
+    const response = await snapshotFile(context, path)
+    if (response?.success) {
+      markMessageHasSnapshot(context.sessionId, context.messageId)
+    }
+  } catch {
+    // best effort
+  }
+}
+
+const executeLocalTool = async (
+  functionName: string,
+  parsedArguments: Record<string, unknown>,
+  availableTool: any,
+  context: { sessionId: string; messageId: string } | null = null,
+) => {
+  console.log('[KukeAgent][DEBUG] executeLocalTool 被调用:', functionName, '参数:', JSON.stringify(parsedArguments))
   if (typeof availableTool !== 'function') {
     return {
       success: false,
@@ -380,25 +2679,348 @@ const executeLocalTool = async (functionName: string, parsedArguments: Record<st
     }
   }
 
+  const sessionIdForConfirm = context?.sessionId ?? currentSessionId.value
+  const riskLevel = normalizeRiskLevel(parsedArguments?.riskLevel)
+  const riskReason = String(parsedArguments?.riskReason ?? '').trim()
+
+  if (sessionIdForConfirm) {
+    const gate = decideToolGate(
+      functionName,
+      parsedArguments,
+      riskLevel,
+      appSettings.value.safetyMode,
+      sessionIdForConfirm,
+    )
+    if (gate.kind === 'deny') {
+      return {
+        success: false,
+        denied: true,
+        error: gate.reason,
+        riskLevel,
+        riskReason,
+      }
+    }
+    if (gate.kind === 'confirm') {
+      const decision = await requestToolConfirmation(
+        functionName,
+        parsedArguments,
+        riskLevel,
+        riskReason,
+        sessionIdForConfirm,
+        {
+          allowlistAction: gate.allowlistAction,
+          bashCommand: gate.bashCommand,
+        },
+      )
+      if (decision === 'deny') {
+        return {
+          success: false,
+          denied: true,
+          error: '用户拒绝执行此操作。',
+          riskLevel,
+          riskReason,
+        }
+      }
+    }
+  }
+
+  if (FILE_MUTATING_TOOLS.has(functionName)) {
+    const targetPath = getArgumentByAliases(parsedArguments, ['filePath', 'path', 'file', 'targetPath', 'notebookPath'])
+    await tryPrepareSnapshot(context, targetPath)
+  }
+
   switch (functionName) {
-    case 'readDir':
-      return await availableTool(String(parsedArguments.dirPath ?? ''))
-    case 'readFile':
-      return await availableTool(String(parsedArguments.filePath ?? ''))
-    case 'writeFile':
+    case 'FileReadTool':
+    case 'readFile': {
+      const filePath = getArgumentByAliases(parsedArguments, ['filePath', 'path', 'file', 'targetPath'])
+      const offset = getArgumentByAliases(parsedArguments, ['offset', 'start', 'fromLine'])
+      const limit = getArgumentByAliases(parsedArguments, ['limit', 'lines', 'maxLines', 'count'])
+      return await availableTool({
+        filePath: stringifyArgument(filePath),
+        offset: offset === undefined || offset === null || offset === '' ? undefined : Number(offset),
+        limit: limit === undefined || limit === null || limit === '' ? undefined : Number(limit),
+      })
+    }
+    case 'FileWriteTool':
+    case 'writeFile': {
+      const filePath = getArgumentByAliases(parsedArguments, ['filePath', 'path', 'file', 'targetPath'])
+      const content = getArgumentByAliases(parsedArguments, ['content', 'text', 'data', 'body'])
       return await availableTool(
-        String(parsedArguments.filePath ?? ''),
-        String(parsedArguments.content ?? ''),
+        stringifyArgument(filePath),
+        stringifyArgument(content),
       )
-    case 'execCommand':
-      return await availableTool(
-        String(parsedArguments.command ?? ''),
-        parsedArguments.cwd ? String(parsedArguments.cwd) : undefined,
-      )
-    default:
-      return await availableTool(parsedArguments)
+    }
+    case 'FileDeleteTool': {
+      const filePath = getArgumentByAliases(parsedArguments, ['filePath', 'path', 'file', 'targetPath'])
+      const recursiveRaw = getArgumentByAliases(parsedArguments, ['recursive', 'force'])
+      return await availableTool({
+        filePath: stringifyArgument(filePath),
+        recursive: Boolean(recursiveRaw),
+        __context: context,
+      })
+    }
+    case 'NotebookEditTool': {
+      const notebookPath = getArgumentByAliases(parsedArguments, ['notebookPath', 'filePath', 'path', 'file'])
+      const cellId = getArgumentByAliases(parsedArguments, ['cellId', 'cell_id', 'id'])
+      const cellType = getArgumentByAliases(parsedArguments, ['cellType', 'cell_type'])
+      const editMode = getArgumentByAliases(parsedArguments, ['editMode', 'edit_mode', 'mode'])
+      const newSource = getArgumentByAliases(parsedArguments, ['newSource', 'new_source', 'source', 'content'])
+      return await availableTool({
+        notebookPath: stringifyArgument(notebookPath),
+        cellId: cellId === undefined || cellId === null ? '' : String(cellId),
+        cellType: cellType === undefined || cellType === null ? undefined : String(cellType),
+        editMode: editMode === undefined || editMode === null ? undefined : String(editMode),
+        newSource: newSource === undefined || newSource === null ? '' : String(newSource),
+        __context: context,
+      })
+    }
+    case 'BashTool':
+    case 'execCommand': {
+      const command = getArgumentByAliases(parsedArguments, ['command', 'cmd', 'script'])
+      const cwd = getArgumentByAliases(parsedArguments, ['cwd', 'workdir', 'workingDirectory', 'path'])
+      const description = getArgumentByAliases(parsedArguments, ['description', 'desc'])
+      const timeoutRaw = getArgumentByAliases(parsedArguments, ['timeout', 'timeoutMs'])
+      const runInBackground = getArgumentByAliases(parsedArguments, ['runInBackground', 'run_in_background', 'background'])
+      return await availableTool({
+        command: stringifyArgument(command),
+        cwd: cwd === undefined || cwd === null || cwd === '' ? undefined : String(cwd),
+        description: description === undefined || description === null ? '' : String(description),
+        timeout: timeoutRaw === undefined || timeoutRaw === null || timeoutRaw === '' ? undefined : Number(timeoutRaw),
+        runInBackground: Boolean(runInBackground),
+      })
+    }
+    case 'BashOutputTool': {
+      const bashId = getArgumentByAliases(parsedArguments, ['bashId', 'bash_id', 'id'])
+      const filter = getArgumentByAliases(parsedArguments, ['filter', 'regex', 'pattern'])
+      return await availableTool({
+        bashId: stringifyArgument(bashId),
+        filter: filter === undefined || filter === null ? '' : String(filter),
+      })
+    }
+    case 'KillShellTool': {
+      const bashId = getArgumentByAliases(parsedArguments, ['bashId', 'bash_id', 'id'])
+      return await availableTool({ bashId: stringifyArgument(bashId) })
+    }
+    case 'SetWorkspaceRootTool': {
+      const targetPath = getArgumentByAliases(parsedArguments, ['path', 'cwd', 'workspaceRoot', 'root', 'dir'])
+      const result = await availableTool({ path: stringifyArgument(targetPath) })
+      if (result?.success && typeof result?.data?.cwd === 'string') {
+        currentWorkspaceCwd.value = result.data.cwd
+      }
+      return result
+    }
+    case 'GetWorkspaceRootTool': {
+      const result = await availableTool()
+      if (result?.success && typeof result?.data?.cwd === 'string') {
+        currentWorkspaceCwd.value = result.data.cwd
+      }
+      return result
+    }
+    case 'WebFetchTool': {
+      const url = getArgumentByAliases(parsedArguments, ['url', 'href', 'link', 'targetUrl'])
+      const prompt = getArgumentByAliases(parsedArguments, ['prompt', 'question', 'query'])
+      const llmConfig = currentProvider.value && selectedModel.value
+        ? {
+            apiKey: currentProvider.value.apiKey,
+            baseURL: currentProvider.value.baseURL,
+            model: selectedModel.value,
+          }
+        : null
+      return await availableTool({
+        url: stringifyArgument(url),
+        prompt: prompt === undefined || prompt === null ? '' : String(prompt),
+        llmConfig,
+      })
+    }
+    case 'WebSearchTool': {
+      const query = getArgumentByAliases(parsedArguments, ['query', 'keyword', 'keywords', 'q'])
+      const count = getArgumentByAliases(parsedArguments, ['count', 'limit', 'num', 'maxResults'])
+      const allowedDomains = getArgumentByAliases(parsedArguments, ['allowedDomains', 'allowed_domains', 'include_domains'])
+      const blockedDomains = getArgumentByAliases(parsedArguments, ['blockedDomains', 'blocked_domains', 'exclude_domains'])
+      return await availableTool({
+        query: stringifyArgument(query),
+        count: count === undefined || count === null || count === '' ? undefined : Number(count),
+        apiKey: appSettings.value.tavilyApiKey,
+        allowedDomains: Array.isArray(allowedDomains) ? allowedDomains.map((item) => String(item)) : [],
+        blockedDomains: Array.isArray(blockedDomains) ? blockedDomains.map((item) => String(item)) : [],
+      })
+    }
+    case 'GlobTool': {
+      const limit = getArgumentByAliases(parsedArguments, ['limit', 'maxResults', 'max'])
+      return await availableTool({
+        pattern: stringifyArgument(getArgumentByAliases(parsedArguments, ['pattern', 'glob', 'match'])),
+        path: stringifyArgument(getArgumentByAliases(parsedArguments, ['path', 'cwd', 'root', 'dir'])) || undefined,
+        includeDirectories: Boolean(getArgumentByAliases(parsedArguments, ['includeDirectories', 'withDirectories'])),
+        limit: limit === undefined || limit === null || limit === '' ? undefined : Number(limit),
+      })
+    }
+    case 'GrepTool': {
+      const outputMode = getArgumentByAliases(parsedArguments, ['outputMode', 'output_mode'])
+      const beforeContextRaw = getArgumentByAliases(parsedArguments, ['beforeContext', 'before_context', '-B'])
+      const afterContextRaw = getArgumentByAliases(parsedArguments, ['afterContext', 'after_context', '-A'])
+      const contextRaw = getArgumentByAliases(parsedArguments, ['context', '-C'])
+      const headLimitRaw = getArgumentByAliases(parsedArguments, ['headLimit', 'head_limit', 'limit', 'maxResults'])
+      const offsetRaw = getArgumentByAliases(parsedArguments, ['offset'])
+      const isRegexRaw = getArgumentByAliases(parsedArguments, ['isRegex', 'is_regex', 'regex'])
+      const showLineNumbersRaw = getArgumentByAliases(parsedArguments, ['showLineNumbers', '-n', 'show_line_numbers'])
+      return await availableTool({
+        pattern: stringifyArgument(getArgumentByAliases(parsedArguments, ['pattern', 'query', 'keyword'])),
+        path: stringifyArgument(getArgumentByAliases(parsedArguments, ['path', 'cwd', 'root', 'dir'])) || undefined,
+        glob: stringifyArgument(getArgumentByAliases(parsedArguments, ['glob', 'filePattern', 'include'])) || undefined,
+        type: getArgumentByAliases(parsedArguments, ['type', 'types']),
+        outputMode: outputMode === undefined || outputMode === null ? undefined : String(outputMode),
+        isRegex: isRegexRaw === undefined || isRegexRaw === null ? undefined : Boolean(isRegexRaw),
+        caseSensitive: Boolean(getArgumentByAliases(parsedArguments, ['caseSensitive', 'matchCase'])),
+        multiline: Boolean(getArgumentByAliases(parsedArguments, ['multiline', 'multi_line'])),
+        beforeContext: beforeContextRaw === undefined || beforeContextRaw === null || beforeContextRaw === '' ? undefined : Number(beforeContextRaw),
+        afterContext: afterContextRaw === undefined || afterContextRaw === null || afterContextRaw === '' ? undefined : Number(afterContextRaw),
+        context: contextRaw === undefined || contextRaw === null || contextRaw === '' ? undefined : Number(contextRaw),
+        showLineNumbers: showLineNumbersRaw === undefined || showLineNumbersRaw === null ? undefined : Boolean(showLineNumbersRaw),
+        headLimit: headLimitRaw === undefined || headLimitRaw === null || headLimitRaw === '' ? undefined : Number(headLimitRaw),
+        offset: offsetRaw === undefined || offsetRaw === null || offsetRaw === '' ? undefined : Number(offsetRaw),
+      })
+    }
+    case 'TodoWriteTool': {
+      const todos = getArgumentByAliases(parsedArguments, ['todos', 'tasks', 'items'])
+      const result = await availableTool({
+        todos: Array.isArray(todos) ? todos : [],
+      })
+      if (result?.success && Array.isArray(result?.data?.todos) && context?.sessionId) {
+        applySessionTodos(context.sessionId, result.data.todos)
+      }
+      return result
+    }
+    case 'FileEditTool':
+    default: {
+      console.log('[KukeAgent][DEBUG] default case 工具调用:', functionName, '参数:', JSON.stringify(parsedArguments))
+      const enrichedArgs = context
+        ? { ...parsedArguments, __context: context }
+        : parsedArguments
+      return await availableTool(enrichedArgs)
+    }
   }
 }
+
+const markMessageHasSnapshot = (sessionId: string, messageId: string) => {
+  updateMessageById(sessionId, messageId, (message) =>
+    message.hasSnapshot ? message : { ...message, hasSnapshot: true },
+  )
+}
+
+const canRollbackMessage = (message: ChatMessage) => message.role === 'user'
+
+const rollbackMessageState = ref<{ messageId: string; phase: 'restoring' | 'done' } | null>(null)
+
+const rollbackToMessage = async (message: ChatMessage) => {
+  if (message.role !== 'user') {
+    return
+  }
+  const sessionId = currentSessionId.value
+  if (!sessionId) return
+
+  const runtime = ensureSessionRuntime(sessionId)
+  if (runtime.isLoading) {
+    await stopSessionRequest(sessionId, { silent: true })
+  }
+
+  rollbackMessageState.value = { messageId: message.id, phase: 'restoring' }
+  let restoredFiles = 0
+  let deletedFiles = 0
+  let restoreErrorText = ''
+
+  try {
+    if (message.hasSnapshot) {
+      const restore = (window as any).localTools?.restoreSnapshot
+      if (typeof restore === 'function') {
+        try {
+          const response = await restore({ sessionId, messageId: message.id })
+          if (response?.success) {
+            restoredFiles = response.data?.restored ?? 0
+            deletedFiles = response.data?.deleted ?? 0
+          } else if (response?.error) {
+            restoreErrorText = String(response.error)
+          }
+        } catch (error) {
+          restoreErrorText = error instanceof Error ? error.message : '回滚失败'
+        }
+      }
+    }
+
+    const session = getSessionById(sessionId)
+    if (!session) return
+    const messageIndex = session.messages.findIndex((item) => item.id === message.id)
+    if (messageIndex === -1) return
+
+    const messagesToRemove = session.messages.slice(messageIndex)
+    const clearMsgSnapshot = (window as any).localTools?.clearMessageSnapshot
+    if (typeof clearMsgSnapshot === 'function') {
+      for (const removed of messagesToRemove) {
+        if (removed.id === message.id) continue
+        if (removed.role === 'user' && removed.hasSnapshot) {
+          try {
+            await clearMsgSnapshot({ sessionId, messageId: removed.id })
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    const restoredAttachments = Array.isArray(message.attachments)
+      ? message.attachments.map((attachment) => ({
+          ...attachment,
+          id: createAttachmentId(),
+        }))
+      : []
+    for (const attachment of restoredAttachments) {
+      if (attachment.kind === 'image' && !attachment.previewDataUrl && attachment.path) {
+        void ensureMessageImagePreview(attachment)
+      }
+    }
+    input.value = String(message.content ?? '')
+    composerAttachments.value = restoredAttachments
+
+    mutateSessionMessages(sessionId, (list) => {
+      list.splice(messageIndex, list.length - messageIndex)
+    })
+    const sessionAfterSplice = getSessionById(sessionId)
+    if (sessionAfterSplice) {
+      const stillHasUserMessage = sessionAfterSplice.messages.some((item) => item.role === 'user')
+      if (!stillHasUserMessage) {
+        sessionAfterSplice.titleGenerated = false
+      }
+    }
+    updateCurrentSession(sessionId)
+    focusComposer()
+
+    if (restoreErrorText) {
+      showNotice(`已撤回消息，但文件回滚失败：${restoreErrorText}`, 'error')
+    } else if (message.hasSnapshot && (restoredFiles || deletedFiles)) {
+      const segments: string[] = []
+      if (restoredFiles) segments.push(`恢复 ${restoredFiles} 个文件`)
+      if (deletedFiles) segments.push(`删除 ${deletedFiles} 个`)
+      showNotice(`已${segments.join('，')}，消息已放回输入框。`, 'success')
+    } else if (message.hasSnapshot) {
+      showNotice('已撤回消息，但没有文件需要恢复。', 'info')
+    } else {
+      showNotice('已撤回该消息到输入框。', 'success')
+    }
+  } finally {
+    rollbackMessageState.value = null
+  }
+}
+
+const isMessageRolling = (messageId: string) =>
+  rollbackMessageState.value?.messageId === messageId && rollbackMessageState.value.phase === 'restoring'
+
+const getRollbackButtonLabel = (message: ChatMessage) =>
+  message.hasSnapshot ? '回滚到此处' : '撤回到此处'
+
+const getRollbackButtonTitle = (message: ChatMessage) =>
+  message.hasSnapshot
+    ? '回滚 AI 在此消息之后对文件的改动，并将消息放回输入框'
+    : '撤回此消息及其之后的对话，并放回输入框'
+
 
 const stringifyForBlock = (value: unknown) => {
   if (typeof value === 'string') {
@@ -424,6 +3046,7 @@ const getMessageRoleLabel = (role: MessageRole) =>
     assistant: '助手',
     user: '你',
     system: '系统',
+    tool: '工具',
   })[role]
 
 const getToolStatusLabel = (status: ToolInvocationStatus) =>
@@ -435,142 +3058,179 @@ const getToolStatusLabel = (status: ToolInvocationStatus) =>
     error: '失败',
   })[status]
 
-const getToolSummaryText = (message: ChatMessage) => {
-  const total = message.toolInvocations.length
-  if (!total) {
-    return ''
-  }
-
-  const runningCount = message.toolInvocations.filter((tool) => tool.status === 'running').length
-  const finishedCount = message.toolInvocations.filter((tool) => ['success', 'error'].includes(tool.status)).length
-
-  if (runningCount > 0) {
-    return `${total} 个工具，${runningCount} 个执行中`
-  }
-
-  if (finishedCount === total) {
-    return `${total} 个工具已返回`
-  }
-
-  return `${total} 个工具待执行`
-}
-
-const updateMessageById = (messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
-  const targetIndex = messages.value.findIndex((message) => message.id === messageId)
-  if (targetIndex === -1) {
-    return
-  }
-
-  messages.value[targetIndex] = updater(messages.value[targetIndex])
-}
-
-const removeMessageById = (messageId: string) => {
-  messages.value = messages.value.filter((message) => message.id !== messageId)
-}
-
-const appendMessageContent = (
+const updateMessageById = (
+  sessionId: string,
   messageId: string,
-  delta: string,
-  options: {
-    separate?: boolean
-  } = {},
+  updater: (message: ChatMessage) => ChatMessage,
 ) => {
-  updateMessageById(messageId, (message) => {
-    const shouldInsertSpacer =
-      Boolean(options.separate) &&
-      Boolean(delta) &&
-      Boolean(message.content.trim()) &&
-      !message.content.endsWith('\n\n')
-
-    return {
-      ...message,
-      content: `${message.content}${shouldInsertSpacer ? '\n\n' : ''}${delta}`,
+  mutateSessionMessages(sessionId, (messageList) => {
+    const targetIndex = messageList.findIndex((message) => message.id === messageId)
+    if (targetIndex === -1) {
+      return
     }
+    messageList[targetIndex] = updater(messageList[targetIndex])
   })
 }
 
-const resolveToolInvocationLookupKey = (tool: Partial<ToolInvocation>, index?: number) =>
-  String(tool.callId ?? tool.id ?? `tool_${index ?? 0}`)
-
-const syncToolCallsToMessage = (messageId: string, toolCalls: unknown) => {
-  if (!Array.isArray(toolCalls)) {
-    return
-  }
-
-  updateMessageById(messageId, (message) => {
-    const previousTools = message.toolInvocations ?? []
-    const previousToolMap = new Map(previousTools.map((tool, index) => [resolveToolInvocationLookupKey(tool, index), tool]))
-
-    const nextTools = toolCalls.map((toolCall, index) => {
-      const rawCallId = String((toolCall as any)?.id ?? '').trim()
-      const toolLookupKey = rawCallId || `tool_${index}`
-      const currentArguments = String((toolCall as any)?.function?.arguments ?? '')
-      const existingTool = previousToolMap.get(toolLookupKey) ?? previousTools[index]
-      const hasStableArguments = Boolean(currentArguments.trim())
-      const nextStatus =
-        existingTool?.status && !['draft', 'pending'].includes(existingTool.status)
-          ? existingTool.status
-          : hasStableArguments
-            ? 'pending'
-            : 'draft'
-
-      return {
-        id: existingTool?.id ?? toolLookupKey,
-        callId: rawCallId || existingTool?.callId || toolLookupKey,
-        name: String((toolCall as any)?.function?.name ?? existingTool?.name ?? ''),
-        argumentsText: hasStableArguments
-          ? stringifyForBlock(currentArguments)
-          : (existingTool?.argumentsText ?? ''),
-        resultText: existingTool?.resultText ?? '',
-        status: nextStatus,
-        expanded: existingTool?.expanded ?? index === toolCalls.length - 1,
-      } satisfies ToolInvocation
-    })
-
-    const nextToolKeys = new Set(nextTools.map((tool, index) => resolveToolInvocationLookupKey(tool, index)))
-    const preservedTools = previousTools.filter((tool, index) => {
-      const key = resolveToolInvocationLookupKey(tool, index)
-      return !nextToolKeys.has(key) && ['running', 'success', 'error'].includes(tool.status)
-    })
-
-    return {
-      ...message,
-      toolInvocations: [...nextTools, ...preservedTools],
+const appendMessageContent = (
+  sessionId: string,
+  messageId: string,
+  delta: string,
+  _options: {
+    separate?: boolean
+  } = {},
+) => {
+  updateMessageById(sessionId, messageId, (message) => {
+    if (message.role !== 'assistant' || !delta) {
+      return message
     }
+
+    const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
+    const lastBlock = nextBlocks[nextBlocks.length - 1]
+
+    if (lastBlock?.type === 'text') {
+      lastBlock.content = `${lastBlock.content}${delta}`
+    } else {
+      nextBlocks.push({
+        id: createBlockId(),
+        type: 'text',
+        content: delta,
+      })
+    }
+
+    return syncAssistantMessageState({
+      ...message,
+      blocks: nextBlocks,
+    })
+  })
+}
+
+const replaceMessageContent = (
+  sessionId: string,
+  messageId: string,
+  newContent: string,
+) => {
+  updateMessageById(sessionId, messageId, (message) => {
+    if (message.role !== 'assistant') {
+      return message
+    }
+
+    const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
+    const newTextBlocks = nextBlocks.filter((block) => block.type === 'text')
+    const otherBlocks = nextBlocks.filter((block) => block.type !== 'text')
+
+    if (newContent.trim()) {
+      const mergedTextBlock: TextMessageBlock = {
+        id: newTextBlocks.length > 0 ? newTextBlocks[0].id : createBlockId(),
+        type: 'text',
+        content: newContent,
+      }
+      return syncAssistantMessageState({
+        ...message,
+        blocks: [...otherBlocks, mergedTextBlock],
+      })
+    }
+
+    return syncAssistantMessageState({
+      ...message,
+      blocks: otherBlocks,
+    })
   })
 }
 
 const updateToolInvocation = (
+  sessionId: string,
   messageId: string,
   matcher: { toolId?: string; index?: number },
   updater: (tool: ToolInvocation) => ToolInvocation,
 ) => {
-  updateMessageById(messageId, (message) => {
-    const toolInvocations = [...(message.toolInvocations ?? [])]
-    const toolIndex = matcher.toolId
-      ? toolInvocations.findIndex((tool) => tool.id === matcher.toolId || tool.callId === matcher.toolId)
-      : (matcher.index ?? -1)
-    const currentTool = toolInvocations[toolIndex]
-
-    if (!currentTool) {
+  updateMessageById(sessionId, messageId, (message) => {
+    if (message.role !== 'assistant') {
       return message
     }
 
-    toolInvocations[toolIndex] = updater(currentTool)
-    return {
-      ...message,
-      toolInvocations,
+    const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
+    const toolBlockIndices = nextBlocks
+      .map((block, blockIndex) => block.type === 'tool' ? blockIndex : -1)
+      .filter((blockIndex) => blockIndex >= 0)
+    const targetBlockIndex = matcher.toolId
+      ? nextBlocks.findIndex(
+          (block) =>
+            block.type === 'tool' &&
+            (block.toolInvocation.id === matcher.toolId || block.toolInvocation.callId === matcher.toolId),
+        )
+      : toolBlockIndices[matcher.index ?? -1] ?? -1
+    const currentBlock = nextBlocks[targetBlockIndex]
+
+    if (!currentBlock || currentBlock.type !== 'tool') {
+      return message
     }
+
+    nextBlocks[targetBlockIndex] = {
+      ...currentBlock,
+      toolInvocation: updater(currentBlock.toolInvocation),
+    }
+
+    return syncAssistantMessageState({
+      ...message,
+      blocks: nextBlocks,
+    })
   })
 }
 
-const setToolExpanded = (messageId: string, toolId: string, expanded: boolean) => {
-  updateMessageById(messageId, (message) => ({
-    ...message,
-    toolInvocations: message.toolInvocations.map((tool) =>
-      tool.id === toolId ? { ...tool, expanded } : tool,
-    ),
-  }))
+const appendToolInvocation = (
+  sessionId: string,
+  messageId: string,
+  toolInvocation: ToolInvocation,
+) => {
+  updateMessageById(sessionId, messageId, (message) => {
+    if (message.role !== 'assistant') {
+      return message
+    }
+
+    return syncAssistantMessageState({
+      ...message,
+      blocks: [
+        ...cloneMessageBlocks(message.blocks ?? []),
+        {
+          id: createBlockId(),
+          type: 'tool',
+          toolInvocation: {
+            ...cloneToolInvocation(toolInvocation),
+            expanded: toolInvocation.expanded || appSettings.value.autoExpandToolDetails,
+          },
+        },
+      ],
+    })
+  })
+}
+
+const setToolExpandedByBlockId = (messageId: string, blockId: string, expanded: boolean) => {
+  updateMessageById(currentSessionId.value, messageId, (message) => {
+    if (message.role !== 'assistant') {
+      return message
+    }
+
+    const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
+    const blockIndex = nextBlocks.findIndex((block) => block.id === blockId && block.type === 'tool')
+    const currentBlock = nextBlocks[blockIndex]
+    if (!currentBlock || currentBlock.type !== 'tool') {
+      return message
+    }
+
+    nextBlocks[blockIndex] = {
+      ...currentBlock,
+      toolInvocation: {
+        ...currentBlock.toolInvocation,
+        expanded,
+      },
+    }
+
+    return syncAssistantMessageState({
+      ...message,
+      blocks: nextBlocks,
+    })
+  })
 }
 
 const formatSessionTime = (value: number) => {
@@ -593,18 +3253,22 @@ const saveSessionsToStorage = () => {
   localStorage.setItem('kuke_sessions', JSON.stringify(sessions.value))
 }
 
-const updateCurrentSession = () => {
-  const session = sessions.value.find((item) => item.id === currentSessionId.value)
+const updateCurrentSession = (sessionId = currentSessionId.value) => {
+  const session = sessions.value.find((item) => item.id === sessionId)
   if (!session) {
     return
   }
 
-  session.messages = [...messages.value]
+  if (sessionId === currentSessionId.value) {
+    session.messages = cloneMessages(messages.value)
+  }
   session.updatedAt = Date.now()
 
-  const firstUserMessage = messages.value.find((message) => message.role === 'user')
-  if (firstUserMessage) {
-    session.title = buildSessionTitle(firstUserMessage.content)
+  if (!session.titleGenerated) {
+    const firstUserMessage = session.messages.find((message) => message.role === 'user')
+    if (firstUserMessage) {
+      session.title = buildSessionTitle(firstUserMessage.content)
+    }
   }
 
   sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
@@ -618,7 +3282,7 @@ const switchSession = (id: string) => {
   }
 
   currentSessionId.value = id
-  messages.value = normalizeMessages(session.messages)
+  messages.value = cloneMessages(session.messages)
 
   if (window.innerWidth < 768) {
     isSidebarOpen.value = false
@@ -636,14 +3300,27 @@ const createNewSession = () => {
   }
 
   sessions.value.unshift(newSession)
+  ensureSessionRuntime(newSession.id)
   switchSession(newSession.id)
   saveSessionsToStorage()
   focusComposer()
 }
 
-const deleteSession = (id: string, event: Event) => {
+const deleteSession = async (id: string, event: Event) => {
   event.stopPropagation()
+  await stopSessionRequest(id, { silent: true })
+  delete sessionRuntimeState.value[id]
+  delete sessionAlwaysAllow.value[id]
   sessions.value = sessions.value.filter((session) => session.id !== id)
+
+  const clearSnapshots = (window as any).localTools?.clearSessionSnapshots
+  if (typeof clearSnapshots === 'function') {
+    try {
+      await clearSnapshots(id)
+    } catch {
+      // best effort
+    }
+  }
 
   if (!sessions.value.length) {
     createNewSession()
@@ -667,6 +3344,12 @@ const loadSessionsFromStorage = () => {
         ? parsed.map((session) => ({
             ...session,
             messages: normalizeMessages((session as Partial<ChatSession>).messages),
+            systemPromptSnapshot:
+              typeof (session as Partial<ChatSession>).systemPromptSnapshot === 'string' &&
+                (session as Partial<ChatSession>).systemPromptSnapshot?.trim()
+                ? String((session as Partial<ChatSession>).systemPromptSnapshot)
+                : undefined,
+            titleGenerated: Boolean((session as Partial<ChatSession>).titleGenerated),
           }))
         : []
     } catch {
@@ -680,6 +3363,9 @@ const loadSessionsFromStorage = () => {
   }
 
   sessions.value.sort((a, b) => b.updatedAt - a.updatedAt)
+  sessions.value.forEach((session) => {
+    ensureSessionRuntime(session.id)
+  })
   switchSession(sessions.value[0].id)
 }
 
@@ -731,6 +3417,55 @@ const removeProvider = (id: string) => {
   }
 }
 
+const exportProviders = () => {
+  const data = JSON.stringify(providers.value, null, 2)
+  const blob = new Blob([data], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `kuke-providers-${Date.now()}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+  showNotice('供应商配置已导出', 'success')
+}
+
+const importProviders = () => {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.json'
+  input.onchange = async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0]
+    if (!file) return
+    try {
+      const text = await file.text()
+      const imported = JSON.parse(text)
+      if (!Array.isArray(imported)) {
+        showNotice('导入失败：文件格式不正确，需要 JSON 数组。', 'error')
+        return
+      }
+      for (const p of imported) {
+        if (!p.id || !p.name) {
+          showNotice('导入失败：供应商数据缺少必要字段。', 'error')
+          return
+        }
+      }
+      // Merge: add new providers with new IDs, skip if same ID already exists
+      let added = 0
+      for (const p of imported) {
+        var existing = providers.value.find((existing) => existing.id === p.id)
+        if (!existing) {
+          providers.value.push(p)
+          added += 1
+        }
+      }
+      showNotice(`成功导入 ${added} 个供应商（已存在的未覆盖）。`, 'success')
+    } catch (err) {
+      showNotice('导入失败：' + (err instanceof Error ? err.message : String(err)), 'error')
+    }
+  }
+  input.click()
+}
+
 const fetchModels = async () => {
   if (!currentProvider.value.baseURL || !currentProvider.value.apiKey) {
     showNotice('请先填写完整的 Base URL 与 API Key。', 'error')
@@ -770,9 +3505,146 @@ const fetchModels = async () => {
   }
 }
 
+const isRequestStillActive = (sessionId: string, requestId: string) => {
+  const runtime = ensureSessionRuntime(sessionId)
+  return runtime.activeRequestId === requestId && runtime.isLoading
+}
+
+const stopSessionRequest = async (sessionId: string, options: { silent?: boolean } = {}) => {
+  const runtime = ensureSessionRuntime(sessionId)
+  if (!runtime.isLoading || !runtime.activeRequestId) {
+    return
+  }
+
+  runtime.stopRequested = true
+  const cancelChat = (window as any).localTools?.cancelChat
+  if (typeof cancelChat === 'function') {
+    await cancelChat(runtime.activeRequestId)
+  }
+
+  if (!options.silent && currentSessionId.value === sessionId) {
+    showNotice('已请求中断当前会话。', 'info')
+  }
+}
+
+const stopCurrentSessionRequest = async () => {
+  if (!currentSessionId.value) {
+    return
+  }
+  await stopSessionRequest(currentSessionId.value)
+}
+
+const ensureImagePreviewDataUrls = async (attachments: Attachment[]) => {
+  const readDataUrl = (window as any).localTools?.readFileAsDataURL
+  for (const attachment of attachments) {
+    if (attachment.kind !== 'image' || attachment.previewDataUrl) {
+      continue
+    }
+    if (!attachment.path || typeof readDataUrl !== 'function') {
+      continue
+    }
+    try {
+      const response = await readDataUrl(attachment.path)
+      if (response?.success && response.data?.dataUrl) {
+        attachment.previewDataUrl = response.data.dataUrl
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+const buildUserApiMessage = async (message: ChatMessage) => {
+  const attachments = Array.isArray(message.attachments) ? message.attachments : []
+  const attachmentNote = buildAttachmentNoteText(attachments)
+  const textContent = [message.content, attachmentNote].filter(Boolean).join('\n\n')
+  const imageAttachments = attachments.filter((item) => item.kind === 'image')
+  if (!imageAttachments.length) {
+    return { role: 'user', content: textContent }
+  }
+  await ensureImagePreviewDataUrls(imageAttachments)
+  const imageParts = imageAttachments
+    .filter((item) => item.previewDataUrl)
+    .map((item) => ({
+      type: 'image_url',
+      image_url: { url: item.previewDataUrl as string },
+    }))
+  if (!imageParts.length) {
+    return { role: 'user', content: textContent }
+  }
+  return {
+    role: 'user',
+    content: [
+      { type: 'text', text: textContent },
+      ...imageParts,
+    ],
+  }
+}
+
+const sanitizeGeneratedTitle = (raw: string) => {
+  let value = String(raw ?? '').replace(/\r/g, '').trim()
+  value = value.split(/\n+/)[0]?.trim() ?? ''
+  value = value.replace(/^(标题|主题|title)\s*[:：\-]?\s*/i, '')
+  value = value.replace(/^[\s"'`「」『』“”‹›《》【】\[\]（）()]+/, '')
+  value = value.replace(/[\s"'`「」『』“”‹›《》【】\[\]（）()。,.!?！？;；]+$/, '')
+  value = value.trim()
+  if (!value) return ''
+  return value.length > 18 ? `${value.slice(0, 18)}…` : value
+}
+
+const generateSessionTitleAsync = async (sessionId: string, seedContent: string) => {
+  const chat = (window as any).localTools?.chat
+  if (typeof chat !== 'function') return
+  const seed = String(seedContent ?? '').trim()
+  if (!seed) return
+  if (!currentProvider.value?.baseURL || !selectedModel.value) return
+  try {
+    const response = await chat(
+      {
+        apiKey: currentProvider.value.apiKey,
+        baseURL: currentProvider.value.baseURL,
+        model: selectedModel.value,
+      },
+      [
+        {
+          role: 'system',
+          content: '根据用户接下来的一条消息，生成一个简短的中文会话标题。要求：直接输出标题本身，不加引号、不加前缀标签、不加句末标点，不超过 12 个汉字，精确概括话题。',
+        },
+        { role: 'user', content: seed.slice(0, 800) },
+      ],
+      [],
+      {},
+      { requestId: `${sessionId}_title_${createMessageId()}` },
+    )
+    if (!response?.success) return
+    const raw = typeof response.data?.content === 'string'
+      ? response.data.content
+      : Array.isArray(response.data?.content)
+        ? response.data.content
+            .map((part: any) => (typeof part === 'string' ? part : part?.text ?? ''))
+            .join('')
+        : ''
+    const title = sanitizeGeneratedTitle(raw)
+    if (!title) return
+    const targetSession = getSessionById(sessionId)
+    if (!targetSession) return
+    targetSession.title = title
+    targetSession.titleGenerated = true
+    saveSessionsToStorage()
+  } catch {
+    // 标题生成失败不影响主流程
+  }
+}
+
 const sendMessage = async () => {
+  const sessionId = currentSessionId.value
+  if (!sessionId) {
+    return
+  }
+  const runtime = ensureSessionRuntime(sessionId)
   const content = input.value.trim()
-  if (!content || isLoading.value) {
+  const attachmentsSnapshot = composerAttachments.value.map((item) => ({ ...item }))
+  if ((!content && !attachmentsSnapshot.length) || runtime.isLoading) {
     return
   }
 
@@ -782,24 +3654,52 @@ const sendMessage = async () => {
     return
   }
 
-  messages.value.push(createMessage('user', content))
+  const userMessage = createMessage('user', content, {
+    attachments: attachmentsSnapshot.map(serializeAttachmentForStorage),
+  })
+  attachmentsSnapshot.forEach((attachment) => {
+    if (attachment.kind === 'image' && attachment.previewDataUrl) {
+      messageImagePreview.value[attachment.id] = attachment.previewDataUrl
+    }
+  })
+  appendSessionMessage(sessionId, userMessage)
   input.value = ''
+  clearComposerAttachments()
+  updateCurrentSession(sessionId)
 
+  const session = getSessionById(sessionId)
+  if (!session) {
+    return
+  }
+
+  const userMessageCount = session.messages.filter((item) => item.role === 'user').length
+  if (userMessageCount === 1 && content) {
+    void generateSessionTitleAsync(sessionId, content)
+  }
+  const sessionSystemPrompt = ensureSessionSystemPrompt(sessionId)
+  const resolvedSystemPrompt = resolveSystemPromptPlaceholders(sessionSystemPrompt)
   const apiMessages: any[] = [
-    { role: 'system', content: systemPrompt.value },
-    ...messages.value
-      .filter((message) => message.role !== 'system')
-      .map(({ role, content: messageContent }) => ({ role, content: messageContent })),
+    { role: 'system', content: resolvedSystemPrompt },
   ]
-
+  for (const existing of session.messages) {
+    if (['system', 'tool'].includes(existing.role)) continue
+    if (existing.role === 'user') {
+      apiMessages.push(await buildUserApiMessage(existing))
+    } else {
+      apiMessages.push({ role: existing.role, content: existing.content })
+    }
+  }
+  runtime.isLoading = true
+  runtime.stopRequested = false
+  const requestId = `${sessionId}_${createMessageId()}`
+  runtime.activeRequestId = requestId
+  const snapshotContext = { sessionId, messageId: userMessage.id }
   const assistantMessage = createMessage('assistant', '', {
     isStreaming: true,
     toolInvocations: [],
   })
-  messages.value.push(assistantMessage)
+  appendSessionMessage(sessionId, assistantMessage)
   const assistantMessageId = assistantMessage.id
-  isLoading.value = true
-  updateCurrentSession()
   scrollToBottom()
 
   try {
@@ -808,174 +3708,359 @@ const sendMessage = async () => {
       baseURL: currentProvider.value.baseURL,
       model: selectedModel.value,
     }
-    let firstResponseStreamed = false
+    const enabledToolsForRequest = appSettings.value.enableLocalTools ? enabledTools.value : []
+    const configuredToolRoundLimit = appSettings.value.enableToolRoundLimit
+      ? clampToolRoundLimit(appSettings.value.maxToolCallRounds)
+      : null
+    let currentRound = 0
+    let hasAssistantText = false
+    let stoppedByToolError = false
+    const roundFileChanges = new Map<string, { added: number; removed: number; kind: string }>()
 
-    const response = await chat(
-      chatConfig,
-      apiMessages,
-      tools,
-      {
-        onEvent: (event: any) => {
-          if (event.type === 'content_delta' && event.delta) {
-            firstResponseStreamed = true
-            appendMessageContent(assistantMessageId, String(event.delta))
-          }
+    while (true) {
+      if (configuredToolRoundLimit !== null && currentRound >= configuredToolRoundLimit) {
+        break
+      }
+      let currentRoundStreamed = false
+      const response = await chat(
+        chatConfig,
+        apiMessages,
+        enabledToolsForRequest,
+        {
+          onEvent: (event: any) => {
+            if (!isRequestStillActive(sessionId, requestId)) {
+              return
+            }
+            if (appSettings.value.enableStreamResponse && event.type === 'content_delta' && event.delta) {
+              appendMessageContent(sessionId, assistantMessageId, String(event.delta), {
+                separate: hasAssistantText && !currentRoundStreamed,
+              })
+              currentRoundStreamed = true
+              hasAssistantText = true
+            }
 
-          if (event.type === 'tool_calls_delta' && Array.isArray(event.toolCalls)) {
-            syncToolCallsToMessage(assistantMessageId, event.toolCalls)
-          }
+            if (event.type === 'content_replace') {
+              replaceMessageContent(sessionId, assistantMessageId, String(event.content ?? ''))
+            }
 
-          scrollToBottom()
+            if (appSettings.value.autoScrollWhileStreaming && currentSessionId.value === sessionId) {
+              scrollToBottom()
+            }
+          },
         },
-      },
-    )
+        { requestId, sessionId },
+      )
 
-    if (!response.success) {
-      throw new Error(response.error || '请求失败')
-    }
+      if (!isRequestStillActive(sessionId, requestId)) {
+        break
+      }
+      if (!response.success) {
+        if (response.aborted || runtime.stopRequested) {
+          break
+        }
+        throw new Error(response.error || '请求失败')
+      }
 
-    const message = response.data
+      const assistantRoundMessage = response.data
+      const assistantRoundText =
+        typeof assistantRoundMessage?.content === 'string' ? assistantRoundMessage.content : ''
 
-    if (!firstResponseStreamed && typeof message.content === 'string' && message.content) {
-      updateMessageById(assistantMessageId, (current) => ({
-        ...current,
-        content: message.content,
-      }))
-    }
+      if (!currentRoundStreamed && assistantRoundText) {
+        appendMessageContent(sessionId, assistantMessageId, assistantRoundText, {
+          separate: hasAssistantText,
+        })
+        hasAssistantText = true
+      }
 
-    if (message.tool_calls?.length) {
-      syncToolCallsToMessage(assistantMessageId, message.tool_calls)
-      apiMessages.push(message)
+      const toolCalls = Array.isArray(assistantRoundMessage?.tool_calls)
+        ? assistantRoundMessage.tool_calls
+        : []
 
-      for (const [toolIndex, toolCall] of message.tool_calls.entries()) {
-        const functionName = toolCall.function.name
-        const rawArguments = toolCall.function.arguments || '{}'
+      apiMessages.push(assistantRoundMessage)
+
+      if (!toolCalls.length) {
+        break
+      }
+
+      for (const [toolIndex, toolCall] of toolCalls.entries()) {
+        if (!isRequestStillActive(sessionId, requestId) || runtime.stopRequested) {
+          break
+        }
+        console.log('[KukeAgent][DEBUG] ToolCall 原始结构:', JSON.stringify(toolCall, null, 2))
+        const functionName = toolCall.function?.name ?? toolCall.name ?? (toolCall as any).function_name
+        const rawArguments = toolCall.function?.arguments ?? toolCall.arguments ?? (toolCall as any).arguments_json ?? '{}'
+        console.log('[KukeAgent][DEBUG] 解析后 functionName:', functionName, '| rawArguments:', rawArguments, '| toolCall.id:', toolCall.id, '| toolCall.type:', toolCall.type)
         const availableTool = (window as any).localTools?.[functionName]
+        console.log('[KukeAgent][DEBUG] availableTool 查找结果:', availableTool ? 'found: ' + functionName : 'NOT FOUND for: ' + functionName, '| localTools keys:', Object.keys((window as any).localTools ?? {}).join(', '))
         const parsedArguments = tryParseJson(rawArguments)
-        const toolCallId = String(toolCall.id ?? `tool_${toolIndex}`)
+        console.log('[KukeAgent][DEBUG] parsedArguments 结果:', parsedArguments === null ? 'PARSE_FAILED' : 'OK', '| typeof:', typeof parsedArguments)
+        const toolCallId = String(toolCall.id ?? `tool_${currentRound}_${toolIndex}`)
+        appendToolInvocation(sessionId, assistantMessageId, {
+          id: toolCallId,
+          callId: toolCallId,
+          name: functionName,
+          argumentsText: stringifyForBlock(rawArguments),
+          resultText: '等待触发工具执行…',
+          status: 'pending',
+          expanded: false,
+        })
 
-        updateToolInvocation(assistantMessageId, { toolId: toolCallId, index: toolIndex }, (tool) => ({
+        updateToolInvocation(sessionId, assistantMessageId, { toolId: toolCallId }, (tool) => ({
           ...tool,
           callId: toolCallId,
           name: functionName,
           argumentsText: stringifyForBlock(rawArguments),
           resultText: '正在等待本地工具返回结果…',
           status: 'running',
-          expanded: true,
+          expanded: tool.expanded,
         }))
-        scrollToBottom()
+        if (currentSessionId.value === sessionId) {
+          scrollToBottom()
+        }
 
         let toolResult: unknown = null
 
         if (parsedArguments === null || typeof parsedArguments !== 'object') {
+          console.error('[KukeAgent][DEBUG] 参数解析失败:', { rawArguments, parsedArguments })
           toolResult = {
             success: false,
             error: '工具参数解析失败',
             rawArguments,
           }
         } else if (typeof availableTool === 'function') {
-          toolResult = await executeLocalTool(functionName, parsedArguments as Record<string, unknown>, availableTool)
+          console.log('[KukeAgent][DEBUG] 开始执行工具:', functionName, '参数:', JSON.stringify(parsedArguments))
+          toolResult = await runToolWithCancel(
+            sessionId,
+            Promise.resolve().then(() =>
+              executeLocalTool(
+                functionName,
+                parsedArguments as Record<string, unknown>,
+                availableTool,
+                snapshotContext,
+              ),
+            ),
+          )
+          console.log('[KukeAgent][DEBUG] 工具执行完成:', functionName, '结果:', JSON.stringify(toolResult).slice(0, 500))
         } else {
+          console.error('[KukeAgent][DEBUG] 工具不存在:', functionName, 'availableTool:', availableTool)
           toolResult = {
             success: false,
             error: '当前环境未提供此本地工具。',
           }
         }
 
-        const toolResultText = stringifyForBlock(toolResult)
-        const toolStatus: ToolInvocationStatus = isToolResultError(toolResult) ? 'error' : 'success'
+        const aborted = isAbortedToolResult(toolResult)
+        const toolResultText = aborted
+          ? '用户已中断该工具执行。'
+          : stringifyForBlock(toolResult)
+        const toolStatus: ToolInvocationStatus = aborted || isToolResultError(toolResult) ? 'error' : 'success'
+
+        const toolResultDiff = !aborted && toolResult && typeof toolResult === 'object' && (toolResult as any)?.success
+          ? normalizeToolDiff((toolResult as any)?.data?.diff)
+          : null
+        if (toolResultDiff && toolStatus === 'success') {
+          const canonicalPath = toolResultDiff.filePath
+            ?? String(getArgumentByAliases(parsedArguments as Record<string, unknown>, ['filePath', 'path', 'notebookPath', 'targetPath', 'file']) ?? '')
+          if (canonicalPath) {
+            const existing = roundFileChanges.get(canonicalPath) ?? { added: 0, removed: 0, kind: functionName }
+            existing.added += toolResultDiff.addedLines
+            existing.removed += toolResultDiff.removedLines
+            existing.kind = functionName
+            roundFileChanges.set(canonicalPath, existing)
+          }
+        }
+
+        let serializedToolResult = ''
+        if (typeof toolResult === 'string') {
+          serializedToolResult = toolResult
+        } else {
+          try {
+            serializedToolResult = JSON.stringify(toolResult)
+          } catch {
+            serializedToolResult = String(toolResult)
+          }
+        }
 
         apiMessages.push({
           role: 'tool',
-          tool_call_id: toolCall.id,
+          tool_call_id: toolCall.id ?? toolCallId,
           name: functionName,
-          content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          content: serializedToolResult,
         })
 
-        updateToolInvocation(assistantMessageId, { toolId: toolCallId, index: toolIndex }, (tool) => ({
+        updateToolInvocation(sessionId, assistantMessageId, { toolId: toolCallId }, (tool) => ({
           ...tool,
           resultText: toolResultText,
           status: toolStatus,
-          expanded: toolStatus === 'error',
+          diff: toolResultDiff,
+          expanded: tool.expanded,
         }))
-        await loadDebugLogs()
-        scrollToBottom()
+        if (appSettings.value.stopWhenToolError && toolStatus === 'error') {
+          stoppedByToolError = true
+          break
+        }
+        await maybeLoadDebugLogs()
+        if (appSettings.value.autoScrollWhileStreaming && currentSessionId.value === sessionId) {
+          scrollToBottom()
+        }
       }
 
-      let secondResponseStreamed = false
-      const secondResponse = await chat(
-        chatConfig,
-        apiMessages,
-        null,
-        {
-          onEvent: (event: any) => {
-            if (event.type === 'content_delta' && event.delta) {
-              appendMessageContent(assistantMessageId, String(event.delta), { separate: !secondResponseStreamed })
-              secondResponseStreamed = true
-              scrollToBottom()
-            }
-          },
-        },
-      )
-
-      if (!secondResponse.success) {
-        throw new Error(secondResponse.error || '工具调用后续响应失败')
+      if (stoppedByToolError) {
+        appendSessionMessage(
+          sessionId,
+          createMessage('system', '检测到工具调用失败，已根据设置停止后续工具链。请检查错误详情后重试。'),
+        )
+        break
       }
 
-      if (!secondResponseStreamed && secondResponse.data.content) {
-        appendMessageContent(assistantMessageId, secondResponse.data.content, { separate: true })
+      if (runtime.stopRequested || !isRequestStillActive(sessionId, requestId)) {
+        break
       }
+
+      currentRound += 1
     }
 
-    updateMessageById(assistantMessageId, (current) => ({
+    const summaryFiles: ChangeSummaryFile[] = []
+    let summaryAdded = 0
+    let summaryRemoved = 0
+    for (const [path, stats] of roundFileChanges.entries()) {
+      summaryFiles.push({
+        path,
+        added: stats.added,
+        removed: stats.removed,
+        kind: stats.kind,
+      })
+      summaryAdded += stats.added
+      summaryRemoved += stats.removed
+    }
+    const roundChangeSummary: ChangeSummary | null = summaryFiles.length
+      ? { files: summaryFiles, addedLines: summaryAdded, removedLines: summaryRemoved }
+      : null
+
+    updateMessageById(sessionId, assistantMessageId, (current) => ({
       ...current,
       isStreaming: false,
-      content: current.content.trim() || current.toolInvocations.length > 0
-        ? current.content
-        : '已完成请求，但模型未返回可展示文本。',
+      content:
+        (current.content.trim() || current.toolInvocations.length > 0)
+          ? current.content
+          : '已完成请求，但模型未返回可展示文本。',
+      changeSummary: roundChangeSummary,
     }))
-    updateCurrentSession()
-  } catch (error) {
-    const message = error instanceof Error ? error.message : '请求失败'
-    const currentAssistantMessage = messages.value.find((item) => item.id === assistantMessageId)
 
-    if (
-      currentAssistantMessage &&
-      !currentAssistantMessage.content.trim() &&
-      !currentAssistantMessage.toolInvocations.length
-    ) {
-      removeMessageById(assistantMessageId)
-    } else {
-      updateMessageById(assistantMessageId, (current) => ({
-        ...current,
-        isStreaming: false,
-      }))
+    if (runtime.stopRequested) {
+      appendSessionMessage(sessionId, createMessage('system', '当前会话请求已中断。'))
+    } else if (configuredToolRoundLimit !== null && currentRound >= configuredToolRoundLimit) {
+      appendSessionMessage(
+        sessionId,
+        createMessage('system', `达到工具调用轮次上限（${configuredToolRoundLimit}），已停止继续调用。请检查工具输出或缩小问题范围后重试。`),
+      )
     }
 
-    messages.value.push(createMessage('system', `请求失败：${message}`))
-    showNotice(message, 'error')
+    updateCurrentSession(sessionId)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '请求失败'
+    mutateSessionMessages(sessionId, (messageList) => {
+      const sanitizedList = messageList
+        .filter((item) => !(item.role === 'assistant' && item.isStreaming && !item.content.trim() && !item.toolInvocations.length))
+        .map((item) => (item.isStreaming ? { ...item, isStreaming: false } : item))
+      messageList.splice(0, messageList.length, ...sanitizedList)
+      messageList.push(createMessage('system', `请求失败：${message}`))
+    })
+    if (currentSessionId.value === sessionId) {
+      showNotice(message, 'error')
+    }
   } finally {
-    isLoading.value = false
-    scrollToBottom()
+    const latestRuntime = sessionRuntimeState.value[sessionId]
+    if (latestRuntime && latestRuntime.activeRequestId === requestId) {
+      latestRuntime.isLoading = false
+      latestRuntime.activeRequestId = null
+      latestRuntime.stopRequested = false
+    }
+    updateCurrentSession(sessionId)
+    if (currentSessionId.value === sessionId) {
+      scrollToBottom()
+    }
   }
 }
 
 onMounted(() => {
   ensureProviderSelection()
   loadSessionsFromStorage()
-  loadDebugLogs()
+  document.addEventListener('pointerdown', handleDocumentPointerDown)
+  document.addEventListener('keydown', handleGlobalKeydown)
+  document.addEventListener('click', handleDocumentCopyClick)
+  void maybeLoadDebugLogs(true)
   environmentReady.value = Boolean((window as any).localTools?.chat)
+
+  try {
+    const subscribe = (window as any).localTools?.onLaunchPayload
+    if (typeof subscribe === 'function') {
+      launchPayloadUnsubscribe = subscribe((payload: unknown) => {
+        if (typeof payload === 'string') {
+          handleLaunchPayload(payload)
+        }
+      })
+    } else {
+      const getPayload = (window as any).localTools?.getPendingLaunchPayload
+      if (typeof getPayload === 'function') {
+        const pendingQuery = getPayload()
+        if (typeof pendingQuery === 'string') {
+          handleLaunchPayload(pendingQuery)
+        }
+      }
+    }
+  } catch { /* best effort */ }
+
+  try {
+    (window as any).localTools?.cleanupUploads?.()
+  } catch { /* best effort */ }
+
+  try {
+    const envResult = (window as any).localTools?.getEnvironment?.()
+    if (envResult?.success && envResult.data && typeof envResult.data === 'object') {
+      const next: Record<string, string> = {}
+      for (const [key, value] of Object.entries(envResult.data)) {
+        next[key] = value == null ? '' : String(value)
+      }
+      environmentInfo.value = next
+    }
+  } catch {
+    // best-effort; placeholders will fall back to browser-side values
+  }
 
   if (!environmentReady.value) {
     showNotice('当前处于浏览器预览模式，聊天与本地工具需在插件环境中使用。', 'info')
   }
 
+  void applyWorkspaceRootFromSettings()
+
+  refreshActiveBashShells()
+  bashShellsPollTimer = setInterval(refreshActiveBashShells, 3000)
+
   focusComposer()
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', handleDocumentPointerDown)
+  document.removeEventListener('keydown', handleGlobalKeydown)
+  document.removeEventListener('click', handleDocumentCopyClick)
   if (noticeTimer) {
     clearTimeout(noticeTimer)
+  }
+  if (copiedMessageResetTimer) {
+    clearTimeout(copiedMessageResetTimer)
+  }
+  if (copiedToolResetTimer) {
+    clearTimeout(copiedToolResetTimer)
+  }
+  if (bashShellsPollTimer) {
+    clearInterval(bashShellsPollTimer)
+  }
+  if (launchPayloadUnsubscribe) {
+    try {
+      launchPayloadUnsubscribe()
+    } catch { /* best effort */ }
+    launchPayloadUnsubscribe = null
   }
 })
 </script>
@@ -1058,7 +4143,7 @@ onBeforeUnmount(() => {
         <div class="p-3 border-t border-zinc-200/80">
           <button 
             class="motion-list-item flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-900"
-            @click="showSettings = true"
+            @click="openSettings('tools')"
           >
             <Settings class="h-4 w-4" />
             设置
@@ -1071,7 +4156,7 @@ onBeforeUnmount(() => {
     <main class="relative flex-1 flex flex-col min-w-0 bg-white">
       <!-- Header -->
       <header class="h-14 flex items-center justify-between px-4 border-b border-zinc-100 flex-shrink-0 bg-white/80 backdrop-blur-md z-10 sticky top-0">
-        <div class="flex items-center gap-3">
+        <div class="flex min-w-0 items-center gap-3">
           <button
             v-if="!isSidebarOpen"
             class="motion-icon flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
@@ -1086,18 +4171,230 @@ onBeforeUnmount(() => {
               </h2>
             </div>
           </Transition>
+          <div ref="modelMenuRef" class="model-switcher-shell">
+            <button
+              type="button"
+              class="model-switcher-trigger motion-field"
+              :aria-expanded="isModelMenuOpen"
+              aria-haspopup="listbox"
+              @click="toggleModelMenu"
+            >
+              <span class="model-switcher-copy">
+                <span class="model-switcher-label">{{ selectedModelLabel }}</span>
+              </span>
+              <ChevronDown class="model-switcher-chevron" :class="{ 'is-open': isModelMenuOpen }" />
+            </button>
+            <Transition name="dropdown-fade">
+              <div
+                v-if="isModelMenuOpen"
+                class="model-switcher-menu custom-scrollbar"
+                role="listbox"
+                aria-label="模型列表"
+              >
+                <div class="model-switcher-search-shell">
+                  <input
+                    ref="modelSearchInputRef"
+                    v-model.trim="modelMenuSearch"
+                    type="text"
+                    class="motion-field model-switcher-search"
+                    placeholder="搜索模型或供应商"
+                  />
+                </div>
+                <div
+                  v-for="provider in filteredModelGroups"
+                  :key="provider.id"
+                  class="model-switcher-group"
+                >
+                  <div class="model-switcher-group-label">{{ provider.name }}</div>
+                  <button
+                    v-for="model in provider.matchedModels"
+                    :key="`${provider.id}_${model}`"
+                    type="button"
+                    class="model-switcher-option"
+                    :class="{ 'is-active': selectedProviderId === provider.id && selectedModel === model }"
+                    @click="selectHeaderModel(provider.id, model)"
+                  >
+                    <span class="model-switcher-option-copy">
+                      <span class="model-switcher-option-title">{{ model }}</span>
+                      <span class="model-switcher-option-meta">{{ provider.baseURL || '未配置 Base URL' }}</span>
+                    </span>
+                    <Check
+                      v-if="selectedProviderId === provider.id && selectedModel === model"
+                      class="h-4 w-4 text-zinc-900"
+                    />
+                  </button>
+                </div>
+                <div v-if="!hasFilteredModelOptions" class="model-switcher-empty">
+                  未找到匹配模型，请调整关键词或在设置中新增模型。
+                </div>
+              </div>
+            </Transition>
+          </div>
         </div>
         <div class="flex items-center gap-2">
+          <button
+            v-if="activeBashCount > 0 || activeBashShells.length > 0"
+            type="button"
+            class="motion-chip relative flex items-center gap-1 rounded-md border border-sky-200/60 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100"
+            :title="`后台进程：${activeBashCount} 运行中 / 共 ${activeBashShells.length}`"
+            @click="toggleBashShellsPanel"
+          >
+            <Activity class="h-3.5 w-3.5" />
+            <span>{{ activeBashCount }}</span>
+          </button>
+          <button
+            type="button"
+            class="motion-chip relative flex items-center gap-1 rounded-md border border-zinc-200/60 bg-white px-2 py-1 text-[11px] font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+            :class="{ 'bg-zinc-900 text-white hover:bg-zinc-900 hover:text-white border-zinc-900': isTodoDrawerOpen }"
+            :title="hasCurrentTodos ? `任务：${currentTodoStats.in_progress} 进行中 / ${currentTodoStats.pending} 待办 / ${currentTodoStats.completed} 已完成` : '任务清单（空）'"
+            @click="toggleTodoDrawer"
+          >
+            <ListChecks class="h-3.5 w-3.5" />
+            <span v-if="hasCurrentTodos">{{ currentTodoStats.completed }}/{{ currentTodoStats.total }}</span>
+            <span v-else>任务</span>
+          </button>
           <span class="motion-chip rounded-md border border-zinc-200/50 bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-600">{{ currentProvider.name }}</span>
-          <span class="motion-chip rounded-md border border-zinc-200/50 bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-600">{{ selectedModel }}</span>
+          <button
+            type="button"
+            class="motion-icon flex h-8 w-8 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
+            title="打开设置"
+            @click="openSettings('tools')"
+          >
+            <Settings class="h-4 w-4" />
+          </button>
         </div>
       </header>
 
+      <!-- Background Bash popover -->
+      <Transition name="dropdown-fade">
+        <div
+          v-if="isBashShellsOpen"
+          class="absolute right-4 top-16 z-30 w-[360px] rounded-xl border border-zinc-200 bg-white shadow-xl"
+        >
+          <div class="flex items-center justify-between border-b border-zinc-100 px-3 py-2 text-xs font-semibold text-zinc-600">
+            <span>后台 Bash（{{ activeBashShells.length }}）</span>
+            <div class="flex items-center gap-1">
+              <button
+                type="button"
+                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                title="刷新"
+                @click="refreshActiveBashShells"
+              >
+                <RefreshCw class="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                title="关闭"
+                @click="isBashShellsOpen = false"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+          <div class="max-h-80 overflow-auto px-3 py-2 text-xs custom-scrollbar">
+            <p v-if="!activeBashShells.length" class="py-4 text-center text-zinc-400">当前没有后台进程</p>
+            <div v-else class="flex flex-col gap-2">
+              <div
+                v-for="shell in activeBashShells"
+                :key="shell.bashId"
+                class="rounded-lg border border-zinc-100 bg-zinc-50/60 p-2"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <span class="font-mono text-[11px] text-zinc-500 truncate">{{ shell.bashId }}</span>
+                  <span
+                    class="rounded-full px-2 py-0.5 text-[10px] font-medium"
+                    :class="{
+                      'bg-sky-100 text-sky-700': shell.status === 'running',
+                      'bg-zinc-100 text-zinc-600': shell.status === 'completed' || shell.status === 'exited',
+                      'bg-rose-100 text-rose-700': shell.status === 'killed' || shell.status === 'error',
+                    }"
+                  >{{ shell.status }}</span>
+                </div>
+                <p class="mt-1 break-all font-mono text-[11px] text-zinc-700">{{ shell.command }}</p>
+                <p v-if="shell.description" class="mt-0.5 text-[11px] text-zinc-500">{{ shell.description }}</p>
+                <div class="mt-2 flex items-center justify-between text-[10px] text-zinc-400">
+                  <span>pid {{ shell.pid ?? '-' }} · 启动 {{ new Date(shell.startedAt).toLocaleTimeString() }}</span>
+                  <button
+                    v-if="shell.status === 'running'"
+                    type="button"
+                    class="rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 hover:bg-rose-100"
+                    @click="killBackgroundBashShell(shell.bashId)"
+                  >
+                    终止
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
+      <!-- Todo drawer -->
+      <Transition name="dropdown-fade">
+        <aside
+          v-if="isTodoDrawerOpen"
+          class="absolute right-0 top-14 bottom-0 z-20 flex w-[320px] flex-col border-l border-zinc-200 bg-white/95 backdrop-blur-md shadow-[-8px_0_24px_-16px_rgba(0,0,0,0.12)]"
+        >
+          <div class="flex items-center justify-between border-b border-zinc-100 px-4 py-3">
+            <div class="flex items-center gap-2 text-sm font-semibold text-zinc-800">
+              <ListChecks class="h-4 w-4" />
+              <span>任务清单</span>
+              <span class="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-medium text-zinc-600">{{ currentTodoStats.total }}</span>
+            </div>
+            <button
+              type="button"
+              class="motion-icon flex h-7 w-7 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+              title="关闭"
+              @click="isTodoDrawerOpen = false"
+            >
+              <X class="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div class="flex-1 overflow-auto px-4 py-3 custom-scrollbar">
+            <p v-if="!hasCurrentTodos" class="mt-8 text-center text-xs text-zinc-400">
+              还没有任务。模型可以用 TodoWriteTool 创建任务清单来推进多步工作。
+            </p>
+            <div v-else class="flex flex-col gap-2">
+              <div
+                v-for="(todo, todoIndex) in currentSessionTodos"
+                :key="`${todoIndex}_${todo.content}`"
+                class="rounded-lg border border-zinc-100 bg-zinc-50/60 p-3"
+                :class="{
+                  'border-sky-200 bg-sky-50/80': todo.status === 'in_progress',
+                  'border-emerald-200 bg-emerald-50/60': todo.status === 'completed',
+                }"
+              >
+                <div class="flex items-start gap-2">
+                  <CircleCheck v-if="todo.status === 'completed'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-600" />
+                  <CircleDot v-else-if="todo.status === 'in_progress'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-sky-600" />
+                  <Circle v-else class="mt-0.5 h-4 w-4 flex-shrink-0 text-zinc-400" />
+                  <div class="min-w-0 flex-1">
+                    <p
+                      class="text-sm text-zinc-800"
+                      :class="{
+                        'line-through text-zinc-500': todo.status === 'completed',
+                        'font-semibold text-sky-900': todo.status === 'in_progress',
+                      }"
+                    >{{ todo.status === 'in_progress' ? todo.activeForm : todo.content }}</p>
+                    <p class="mt-0.5 text-[11px] text-zinc-400">
+                      <span v-if="todo.status === 'pending'">待办</span>
+                      <span v-else-if="todo.status === 'in_progress'">进行中</span>
+                      <span v-else>已完成</span>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </Transition>
+
       <!-- Chat Area -->
-      <div ref="chatContainer" class="flex-1 overflow-y-auto px-4 py-6 sm:px-6 custom-scrollbar scroll-smooth">
-        <div class="max-w-3xl mx-auto flex flex-col h-full">
+      <div ref="chatContainer" class="flex-1 min-w-0 overflow-y-auto overflow-x-hidden px-4 py-6 sm:px-6 custom-scrollbar scroll-smooth">
+        <div class="max-w-3xl mx-auto flex min-w-0 flex-col h-full w-full">
           <Transition name="content-switch" mode="out-in">
-            <div :key="hasMessages ? 'messages' : 'empty'" class="flex min-h-0 flex-1 flex-col">
+            <div :key="hasMessages ? 'messages' : 'empty'" class="flex min-w-0 min-h-0 flex-1 flex-col">
               <!-- Empty State -->
               <div v-if="!hasMessages" class="empty-state flex flex-1 flex-col items-center justify-center text-zinc-400">
                 <div class="empty-state-icon mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-200 bg-zinc-50 shadow-sm">
@@ -1107,12 +4404,12 @@ onBeforeUnmount(() => {
               </div>
 
               <!-- Message List -->
-              <div v-else class="flex flex-col gap-8 pb-4">
-                <TransitionGroup name="message-stack" tag="div" class="flex flex-col gap-8">
+              <div v-else class="flex min-w-0 flex-col gap-8 pb-4">
+                <TransitionGroup name="message-stack" tag="div" class="flex min-w-0 flex-col gap-8">
                   <article
                     v-for="message in messages"
                     :key="message.id"
-                    class="message-row group flex gap-4"
+                    class="message-row group flex min-w-0 gap-4"
                     :class="message.role === 'user' ? 'flex-row-reverse' : 'flex-row'"
                   >
                     <!-- Avatar -->
@@ -1120,32 +4417,34 @@ onBeforeUnmount(() => {
                       class="message-avatar-shell mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full shadow-sm"
                       :class="[
                         message.role === 'user' ? 'bg-zinc-100 text-zinc-600 border border-zinc-200/50' : 
-                        message.role === 'system' ? 'bg-amber-50 text-amber-500 border border-amber-200/50' : 'bg-zinc-900 text-zinc-50'
+                        message.role === 'system'
+                          ? 'bg-amber-50 text-amber-500 border border-amber-200/50'
+                          : message.role === 'tool'
+                            ? 'bg-sky-50 text-sky-600 border border-sky-200/60'
+                            : 'bg-zinc-900 text-zinc-50'
                       ]"
                     >
                       <User v-if="message.role === 'user'" class="h-4 w-4" />
                       <Terminal v-else-if="message.role === 'system'" class="h-4 w-4" />
+                      <Wrench v-else-if="message.role === 'tool'" class="h-4 w-4" />
                       <Bot v-else class="h-4 w-4" />
                     </div>
 
                     <!-- Content -->
-                    <div class="flex max-w-[85%] flex-col gap-2 sm:max-w-[80%]" :class="message.role === 'user' ? 'items-end' : 'items-start'">
+                    <div
+                      class="flex min-w-0 max-w-[85%] flex-col gap-2 sm:max-w-[80%]"
+                      :class="message.role === 'user' ? 'items-end' : 'w-full items-start'"
+                    >
                       <div
-                        v-if="message.role === 'system' || (message.role === 'assistant' && message.toolInvocations.length)"
+                        v-if="message.role === 'system' || message.role === 'tool'"
                         class="message-meta-row"
                       >
                         <span
-                          v-if="message.role === 'system'"
+                          v-if="message.role === 'system' || message.role === 'tool'"
                           class="message-role-label"
                           :class="`message-role-label-${message.role}`"
                         >
                           {{ getMessageRoleLabel(message.role) }}
-                        </span>
-                        <span
-                          v-if="message.role === 'assistant' && message.toolInvocations.length"
-                          class="assistant-inline-chip"
-                        >
-                          {{ getToolSummaryText(message) }}
                         </span>
                       </div>
                       <div
@@ -1155,78 +4454,217 @@ onBeforeUnmount(() => {
                             ? 'rounded-2xl rounded-tr-sm bg-zinc-100 px-4 py-2.5 text-zinc-900'
                             : message.role === 'system'
                               ? 'rounded-2xl rounded-tl-sm border border-amber-100 bg-amber-50/30 px-4 py-2.5 font-mono text-xs text-zinc-600'
-                              : 'py-1 text-zinc-800'
+                              : message.role === 'tool'
+                                ? 'w-full py-1 text-zinc-800'
+                              : 'w-full py-1 text-zinc-800'
                         ]"
                       >
                         <template v-if="message.role === 'assistant'">
-                          <div
-                            v-if="hasRenderableContent(message.content)"
-                            class="assistant-rich-message markdown-body prose prose-sm prose-zinc max-w-none"
-                            v-html="renderMarkdown(message.content)"
-                          ></div>
+                          <div v-if="message.blocks.length" class="assistant-block-flow">
+                            <template v-for="block in message.blocks" :key="block.id">
+                              <div
+                                v-if="block.type === 'text' && hasRenderableContent(block.content)"
+                                class="assistant-rich-message markdown-body prose prose-sm prose-zinc max-w-none"
+                                v-html="renderMarkdown(block.content)"
+                              ></div>
 
-                          <div v-if="message.toolInvocations.length" class="tool-embed-list">
-                            <section
-                              v-for="tool in message.toolInvocations"
-                              :key="tool.id"
-                              class="tool-embed-card"
-                              :class="`tool-embed-card-${tool.status}`"
-                            >
-                              <button
-                                type="button"
-                                class="tool-embed-summary"
-                                @click="setToolExpanded(message.id, tool.id, !tool.expanded)"
+                              <section
+                                v-else-if="block.type === 'tool'"
+                                class="tool-embed-card"
+                                :class="`tool-embed-card-${block.toolInvocation.status}`"
                               >
-                                <div class="tool-embed-summary-main">
-                                  <div class="tool-embed-icon">
-                                    <Wrench class="h-4 w-4" />
+                                <button
+                                  type="button"
+                                  class="tool-embed-summary"
+                                  @click="setToolExpandedByBlockId(message.id, block.id, !block.toolInvocation.expanded)"
+                                >
+                                  <div class="tool-embed-summary-main">
+                                    <div class="tool-embed-icon">
+                                      <Wrench class="h-3.5 w-3.5" />
+                                    </div>
+                                    <div class="tool-embed-title-wrap">
+                                      <span class="tool-embed-name">{{ getToolDisplayName(block.toolInvocation.name) }}</span>
+                                      <span v-if="getToolDisplayPurpose(block.toolInvocation.name)" class="tool-embed-purpose">
+                                        · {{ getToolDisplayPurpose(block.toolInvocation.name) }}
+                                      </span>
+                                    </div>
                                   </div>
-                                  <div class="tool-embed-title-wrap">
-                                    <span class="tool-embed-caption">工具调用</span>
-                                    <span class="tool-embed-name">{{ tool.name || '等待工具名称' }}</span>
+
+                                  <div class="tool-embed-summary-side">
+                                    <span
+                                      v-if="block.toolInvocation.diff"
+                                      class="tool-embed-summary-diff-stats"
+                                    >
+                                      <span class="tool-embed-diff-add">+{{ block.toolInvocation.diff.addedLines }}</span>
+                                      <span class="tool-embed-diff-del">−{{ block.toolInvocation.diff.removedLines }}</span>
+                                    </span>
+                                    <span class="tool-status-chip" :class="`tool-status-chip-${block.toolInvocation.status}`">
+                                      <span
+                                        v-if="block.toolInvocation.status === 'running' || block.toolInvocation.status === 'pending' || block.toolInvocation.status === 'draft'"
+                                        class="tool-status-pulse"
+                                        aria-hidden="true"
+                                      ></span>
+                                      {{ getToolStatusLabel(block.toolInvocation.status) }}
+                                    </span>
+                                    <ChevronDown class="tool-embed-chevron" :class="{ 'is-open': block.toolInvocation.expanded }" />
                                   </div>
-                                </div>
+                                </button>
 
-                                <div class="tool-embed-summary-side">
-                                  <span class="tool-status-chip" :class="`tool-status-chip-${tool.status}`">
-                                    {{ getToolStatusLabel(tool.status) }}
-                                  </span>
-                                  <ChevronDown class="tool-embed-chevron" :class="{ 'is-open': tool.expanded }" />
-                                </div>
-                              </button>
-
-                              <Transition name="tool-details">
-                                <div v-if="tool.expanded" class="tool-embed-body">
-                                  <div class="tool-embed-grid">
-                                    <section class="tool-embed-panel">
-                                      <header class="tool-embed-panel-header">参数</header>
-                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ tool.argumentsText || getToolArgumentsPlaceholder(tool) }}</code></pre>
+                                <Transition name="tool-details">
+                                  <div v-if="block.toolInvocation.expanded" class="tool-embed-body">
+                                    <section v-if="block.toolInvocation.diff" class="tool-embed-panel tool-embed-diff-panel">
+                                      <header class="tool-embed-panel-header">
+                                        <span class="tool-embed-panel-label">变更</span>
+                                        <span class="tool-embed-diff-stats">
+                                          <span class="tool-embed-diff-add">+{{ block.toolInvocation.diff.addedLines }}</span>
+                                          <span class="tool-embed-diff-del">−{{ block.toolInvocation.diff.removedLines }}</span>
+                                          <span v-if="block.toolInvocation.diff.filePath" class="tool-embed-diff-path">{{ basenameFromPath(block.toolInvocation.diff.filePath) }}</span>
+                                          <span v-if="block.toolInvocation.diff.tooLarge" class="tool-embed-diff-flag">规模过大已简化</span>
+                                          <span v-else-if="block.toolInvocation.diff.diffTruncated" class="tool-embed-diff-flag">已截断</span>
+                                        </span>
+                                      </header>
+                                      <pre v-if="block.toolInvocation.diff.diffText" class="tool-embed-code tool-embed-diff custom-scrollbar"><template v-for="(line, lineIndex) in splitDiffLines(block.toolInvocation.diff.diffText)" :key="lineIndex"><div :class="diffLineClass(line)">{{ line }}</div></template></pre>
                                     </section>
                                     <section class="tool-embed-panel">
-                                      <header class="tool-embed-panel-header">结果</header>
-                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ tool.resultText || getToolResultPlaceholder(tool) }}</code></pre>
+                                      <header class="tool-embed-panel-header">
+                                        <span class="tool-embed-panel-label">参数</span>
+                                        <button
+                                          type="button"
+                                          class="tool-embed-panel-copy"
+                                          :class="{ 'is-copied': isToolFieldCopied(block.id, 'arguments') }"
+                                          :disabled="!block.toolInvocation.argumentsText"
+                                          @click.stop="copyToolField(block.id, 'arguments', block.toolInvocation.argumentsText)"
+                                        >
+                                          <Check v-if="isToolFieldCopied(block.id, 'arguments')" class="h-3 w-3" />
+                                          <Copy v-else class="h-3 w-3" />
+                                          <span>{{ isToolFieldCopied(block.id, 'arguments') ? '已复制' : '复制' }}</span>
+                                        </button>
+                                      </header>
+                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ block.toolInvocation.argumentsText || getToolArgumentsPlaceholder(block.toolInvocation) }}</code></pre>
+                                    </section>
+                                    <section class="tool-embed-panel">
+                                      <header class="tool-embed-panel-header">
+                                        <span class="tool-embed-panel-label">结果</span>
+                                        <button
+                                          type="button"
+                                          class="tool-embed-panel-copy"
+                                          :class="{ 'is-copied': isToolFieldCopied(block.id, 'result') }"
+                                          :disabled="!block.toolInvocation.resultText"
+                                          @click.stop="copyToolField(block.id, 'result', block.toolInvocation.resultText)"
+                                        >
+                                          <Check v-if="isToolFieldCopied(block.id, 'result')" class="h-3 w-3" />
+                                          <Copy v-else class="h-3 w-3" />
+                                          <span>{{ isToolFieldCopied(block.id, 'result') ? '已复制' : '复制' }}</span>
+                                        </button>
+                                      </header>
+                                      <pre class="tool-embed-code custom-scrollbar"><code>{{ block.toolInvocation.resultText || getToolResultPlaceholder(block.toolInvocation) }}</code></pre>
                                     </section>
                                   </div>
-                                </div>
-                              </Transition>
-                            </section>
+                                </Transition>
+                              </section>
+                            </template>
                           </div>
 
                           <div
-                            v-if="message.isStreaming && !hasRenderableContent(message.content) && !message.toolInvocations.length"
+                            v-if="shouldShowAssistantStreamPlaceholder(message)"
                             class="assistant-stream-placeholder"
                           >
                             <span class="loading-dot"></span>
                             <span class="loading-dot" style="animation-delay: 0.12s"></span>
                             <span class="loading-dot" style="animation-delay: 0.24s"></span>
                           </div>
+                          <section
+                            v-if="message.changeSummary && message.changeSummary.files.length"
+                            class="change-summary-card"
+                          >
+                            <header class="change-summary-header">
+                              <span class="change-summary-title">本轮变更</span>
+                              <span class="change-summary-meta">
+                                <span>共 {{ message.changeSummary.files.length }} 个文件</span>
+                                <span class="change-summary-add">+{{ message.changeSummary.addedLines }}</span>
+                                <span class="change-summary-del">−{{ message.changeSummary.removedLines }}</span>
+                              </span>
+                            </header>
+                            <ul class="change-summary-list">
+                              <li
+                                v-for="file in message.changeSummary.files"
+                                :key="file.path"
+                                class="change-summary-item"
+                              >
+                                <span class="change-summary-kind">{{ file.kind || '修改' }}</span>
+                                <span class="change-summary-path" :title="file.path">{{ basenameFromPath(file.path) }}</span>
+                                <span class="change-summary-stats">
+                                  <span v-if="file.added" class="change-summary-add">+{{ file.added }}</span>
+                                  <span v-if="file.removed" class="change-summary-del">−{{ file.removed }}</span>
+                                </span>
+                              </li>
+                            </ul>
+                          </section>
                         </template>
                         <div
                           v-else-if="message.role === 'system'"
                           class="markdown-body prose prose-sm prose-zinc max-w-none"
                           v-html="renderMarkdown(message.content)"
                         ></div>
-                        <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
+                        <div v-else class="user-message-content">
+                          <div v-if="message.content" class="whitespace-pre-wrap">{{ message.content }}</div>
+                          <div
+                            v-if="message.attachments && message.attachments.length"
+                            class="message-attachment-row"
+                          >
+                            <div
+                              v-for="attachment in message.attachments"
+                              :key="attachment.id"
+                              class="message-attachment-chip"
+                              :class="`message-attachment-chip-${attachment.kind}`"
+                              :title="attachment.path || attachment.name"
+                            >
+                              <div class="message-attachment-chip-media">
+                                <img
+                                  v-if="attachment.kind === 'image' && getMessageAttachmentPreview(attachment)"
+                                  :src="getMessageAttachmentPreview(attachment)"
+                                  alt=""
+                                  @error="() => {}"
+                                />
+                                <Folder v-else-if="attachment.kind === 'folder'" class="h-4 w-4" />
+                                <FileIcon v-else class="h-4 w-4" />
+                              </div>
+                              <div class="message-attachment-chip-body">
+                                <div class="message-attachment-chip-title">{{ attachment.name }}</div>
+                                <div class="message-attachment-chip-meta">{{ getAttachmentLabel(attachment.kind) }}</div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      <div
+                        v-if="canCopyMessage(message) || canRollbackMessage(message)"
+                        class="message-actions"
+                        :class="message.role === 'user' ? 'message-actions-user' : ''"
+                      >
+                        <button
+                          v-if="canRollbackMessage(message)"
+                          type="button"
+                          class="message-action-btn message-action-btn-rollback"
+                          :disabled="isMessageRolling(message.id)"
+                          :title="isMessageRolling(message.id) ? '正在撤回…' : getRollbackButtonTitle(message)"
+                          @click="rollbackToMessage(message)"
+                        >
+                          <RotateCcw class="h-3.5 w-3.5" />
+                          <span>{{ isMessageRolling(message.id) ? '处理中…' : getRollbackButtonLabel(message) }}</span>
+                        </button>
+                        <button
+                          v-if="canCopyMessage(message)"
+                          type="button"
+                          class="message-action-btn"
+                          :class="{ 'is-copied': copiedMessageId === message.id }"
+                          :title="copiedMessageId === message.id ? '已复制' : '复制消息'"
+                          @click="copyMessageText(message)"
+                        >
+                          <Check v-if="copiedMessageId === message.id" class="h-3.5 w-3.5" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                          <span>{{ copiedMessageId === message.id ? '已复制' : '复制' }}</span>
+                        </button>
                       </div>
                     </div>
                   </article>
@@ -1240,82 +4678,308 @@ onBeforeUnmount(() => {
 
       <!-- Composer -->
       <div class="px-4 pb-6 pt-2 bg-gradient-to-t from-white via-white to-transparent">
-        <div class="max-w-3xl mx-auto relative">
+        <div
+          class="composer-root max-w-3xl mx-auto relative"
+          :class="{ 'is-dragging': isComposerDragActive }"
+          @dragover="handleComposerDragOver"
+          @dragleave="handleComposerDragLeave"
+          @drop="handleComposerDrop"
+        >
+          <div v-if="composerAttachments.length" class="composer-attachments">
+            <div
+              v-for="attachment in composerAttachments"
+              :key="attachment.id"
+              class="composer-attachment-chip"
+              :class="`composer-attachment-chip-${attachment.kind}`"
+            >
+              <div class="composer-attachment-chip-media">
+                <img
+                  v-if="attachment.kind === 'image' && attachment.previewDataUrl"
+                  :src="attachment.previewDataUrl"
+                  alt=""
+                />
+                <Folder v-else-if="attachment.kind === 'folder'" class="h-4 w-4" />
+                <FileIcon v-else class="h-4 w-4" />
+              </div>
+              <div class="composer-attachment-chip-body">
+                <div class="composer-attachment-chip-title" :title="attachment.path || attachment.name">
+                  {{ attachment.name }}
+                </div>
+                <div class="composer-attachment-chip-meta">
+                  {{ getAttachmentLabel(attachment.kind) }}
+                  <span v-if="formatBytes(attachment.size)"> · {{ formatBytes(attachment.size) }}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                class="composer-attachment-chip-remove"
+                title="移除附件"
+                @click="removeComposerAttachment(attachment.id)"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
           <form
-            class="motion-surface relative flex items-end overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50/50 shadow-sm focus-within:border-zinc-300 focus-within:bg-white focus-within:ring-4 focus-within:ring-zinc-100"
+            class="composer-form motion-surface relative flex items-center min-h-[52px] rounded-2xl border border-zinc-200 bg-zinc-50/50 shadow-sm"
             @submit.prevent="sendMessage"
           >
             <textarea
               ref="textareaRef"
               v-model="input"
               rows="1"
-              class="w-full max-h-[200px] min-h-[52px] py-3.5 pl-4 pr-24 bg-transparent border-0 focus:ring-0 resize-none text-[15px] leading-relaxed placeholder-zinc-400 custom-scrollbar"
-              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-              @keydown.enter.exact.prevent="sendMessage"
+              class="w-full max-h-[200px] py-3 pl-4 pr-36 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 resize-none text-[15px] leading-[1.5] placeholder-zinc-400 custom-scrollbar rounded-2xl"
+              :placeholder="`输入消息`"
+              @keydown="handleComposerKeydown"
+              @paste="handleComposerPaste"
               style="field-sizing: content;"
             ></textarea>
-            
-            <div class="absolute right-2 bottom-2 flex items-center gap-1.5">
+
+            <div class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1">
+              <div
+                ref="plusMenuRef"
+                class="composer-plus-wrap"
+                @mouseenter="isPlusMenuOpen = true"
+                @mouseleave="isPlusMenuOpen = false"
+              >
+                <button
+                  type="button"
+                  class="motion-icon rounded-xl p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                  title="点击添加文件 · 悬停展开文件夹选项"
+                  @click="triggerFileInput"
+                >
+                  <Plus class="h-5 w-5" />
+                </button>
+                <Transition name="dropdown-fade">
+                  <div v-if="isPlusMenuOpen" class="composer-plus-menu" role="menu">
+                    <button
+                      type="button"
+                      class="composer-plus-menu-item"
+                      @click="triggerFileInput"
+                    >
+                      <FileIcon class="h-4 w-4" />
+                      <span>添加文件</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="composer-plus-menu-item"
+                      @click="triggerFolderInput"
+                    >
+                      <Folder class="h-4 w-4" />
+                      <span>添加文件夹</span>
+                    </button>
+                  </div>
+                </Transition>
+              </div>
               <button
                 type="button"
                 class="motion-icon rounded-xl p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
                 title="上传图片"
+                @click="triggerImageInput"
               >
                 <ImageIcon class="h-5 w-5" />
               </button>
               <button
-                type="submit"
+                :type="isCurrentSessionLoading ? 'button' : 'submit'"
                 class="motion-surface flex items-center justify-center rounded-xl p-2 shadow-sm"
-                :class="input.trim() && !isLoading ? 'bg-zinc-900 text-zinc-50 hover:bg-zinc-800' : 'bg-zinc-200 text-zinc-400 cursor-not-allowed'"
-                :disabled="!input.trim() || isLoading"
+                :class="isCurrentSessionLoading ? 'bg-red-500 text-white hover:bg-red-600' : (input.trim() || composerAttachments.length) ? 'bg-zinc-900 text-zinc-50 hover:bg-zinc-800' : 'bg-zinc-200 text-zinc-400 cursor-not-allowed'"
+                :disabled="!isCurrentSessionLoading && !input.trim() && !composerAttachments.length"
+                :title="isCurrentSessionLoading ? '中断当前会话请求' : '发送消息'"
+                @click="isCurrentSessionLoading ? stopCurrentSessionRequest() : undefined"
               >
-                <Send class="h-4 w-4" />
+                <X v-if="isCurrentSessionLoading" class="h-4 w-4" />
+                <Send v-else class="h-4 w-4" />
               </button>
             </div>
           </form>
+          <input
+            ref="fileInputRef"
+            type="file"
+            multiple
+            class="hidden"
+            @change="handleFileInputChange"
+          />
+          <input
+            ref="folderInputRef"
+            type="file"
+            webkitdirectory
+            directory
+            multiple
+            class="hidden"
+            @change="handleFolderInputChange"
+          />
+          <input
+            ref="imageInputRef"
+            type="file"
+            accept="image/*"
+            multiple
+            class="hidden"
+            @change="handleImageInputChange"
+          />
+          <div v-if="isComposerDragActive" class="composer-drop-overlay">
+            <Paperclip class="h-5 w-5" />
+            <span>松开即附加到消息</span>
+          </div>
           <div class="text-center mt-2.5">
-            <span class="text-[11px] text-zinc-400">Agent 可以调用本地系统能力。执行命令前请确认路径、权限与潜在副作用。</span>
+            <span class="text-[11px] text-zinc-400">支持拖拽 / 粘贴文件、文件夹与图片</span>
           </div>
         </div>
       </div>
     </main>
 
+    <!-- Tool Confirmation Modal -->
+    <Transition name="modal-fade">
+      <div
+        v-if="pendingConfirmation"
+        class="confirm-modal-backdrop fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/28 p-4 backdrop-blur-md"
+      >
+        <div
+          class="confirm-modal-panel"
+          :class="`confirm-modal-panel-${pendingConfirmation.riskLevel}`"
+        >
+          <div class="confirm-modal-accent-strip"></div>
+          <div class="confirm-modal-header">
+            <div class="confirm-modal-icon" :class="`confirm-modal-icon-${pendingConfirmation.riskLevel}`">
+              <AlertTriangle class="h-5 w-5" />
+            </div>
+            <div class="confirm-modal-title-wrap">
+              <h3 class="confirm-modal-title">等待你确认</h3>
+              <span class="confirm-modal-subtitle">
+                AI 想调用一个可能修改系统的工具 · 当前：{{ getSafetyModeLabel(appSettings.safetyMode) }}
+              </span>
+            </div>
+            <span
+              class="confirm-modal-risk-chip"
+              :class="`confirm-modal-risk-chip-${pendingConfirmation.riskLevel}`"
+            >
+              {{ getRiskLevelLabel(pendingConfirmation.riskLevel) }}
+            </span>
+          </div>
+
+          <div class="confirm-modal-body">
+            <div class="confirm-modal-meta">
+              <div class="confirm-modal-meta-cell">
+                <span class="confirm-modal-meta-label">工具</span>
+                <span class="confirm-modal-meta-value">
+                  <Wrench class="h-3.5 w-3.5" /> {{ pendingConfirmation.toolLabel }}
+                </span>
+              </div>
+              <div class="confirm-modal-meta-cell" v-if="pendingConfirmation.toolPurpose">
+                <span class="confirm-modal-meta-label">用途</span>
+                <span class="confirm-modal-meta-value">{{ pendingConfirmation.toolPurpose }}</span>
+              </div>
+            </div>
+
+            <div v-if="pendingConfirmation.riskReason" class="confirm-modal-reason">
+              <span class="confirm-modal-reason-label">AI 说明</span>
+              <p class="confirm-modal-reason-text">{{ pendingConfirmation.riskReason }}</p>
+            </div>
+
+            <div class="confirm-modal-params">
+              <span class="confirm-modal-params-label">调用参数</span>
+              <pre class="confirm-modal-params-pre custom-scrollbar"><code>{{ pendingConfirmation.argsPreview }}</code></pre>
+            </div>
+          </div>
+
+          <div class="confirm-modal-footer">
+            <button
+              type="button"
+              class="confirm-modal-btn confirm-modal-btn-deny"
+              @click="resolvePendingConfirmation('deny')"
+            >
+              拒绝
+            </button>
+            <button
+              v-if="pendingConfirmation.allowlistAction"
+              type="button"
+              class="confirm-modal-btn confirm-modal-btn-remember"
+              @click="resolvePendingConfirmation('allow_and_remember')"
+            >
+              {{ pendingConfirmation.allowlistAction === 'add_to_white' ? '加入白名单并允许' : '从黑名单移除并允许' }}
+            </button>
+            <button
+              v-else
+              type="button"
+              class="confirm-modal-btn confirm-modal-btn-always"
+              @click="resolvePendingConfirmation('allow_always')"
+            >
+              本会话始终允许
+            </button>
+            <button
+              type="button"
+              class="confirm-modal-btn confirm-modal-btn-allow"
+              :class="`confirm-modal-btn-allow-${pendingConfirmation.riskLevel}`"
+              @click="resolvePendingConfirmation('allow_once')"
+            >
+              允许一次
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
     <!-- Settings Modal -->
     <Transition name="modal-fade">
       <div
         v-if="showSettings"
-        class="settings-modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/24 p-4 backdrop-blur-md"
-        @click.self="showSettings = false"
+        class="settings-modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/24 p-3 sm:p-4 backdrop-blur-md"
+        @click.self="closeSettings()"
       >
-        <div class="settings-modal-panel flex h-[600px] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-zinc-100 bg-white shadow-2xl">
+        <div class="settings-modal-panel flex w-full flex-col overflow-hidden rounded-2xl border border-zinc-100 bg-white shadow-2xl">
         <!-- Header -->
         <div class="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
           <h3 class="text-base font-semibold text-zinc-800">设置</h3>
-          <button @click="showSettings = false" class="motion-icon rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700">
+          <button @click="closeSettings()" class="motion-icon rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700">
             <X class="h-5 w-5" />
           </button>
         </div>
-        
+
         <!-- Body -->
-        <div class="flex flex-1 overflow-hidden">
+        <div class="settings-modal-body flex flex-1 overflow-hidden">
           <!-- Settings Sidebar -->
-          <div class="w-[180px] border-r border-zinc-100 bg-zinc-50/30 p-3 flex flex-col gap-1">
-            <button 
-              class="motion-list-item w-full rounded-lg px-3 py-2 text-left text-sm font-medium"
+          <div class="settings-tabs border-r border-zinc-100 bg-zinc-50/30 p-3 flex flex-col gap-1">
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
               :class="activeSettingsTab === 'general' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
               @click="activeSettingsTab = 'general'"
             >
-              通用设置
+              <span class="inline-flex items-center gap-2">
+                <Settings class="h-4 w-4" />
+                通用设置
+              </span>
             </button>
-            <button 
-              class="motion-list-item w-full rounded-lg px-3 py-2 text-left text-sm font-medium"
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
+              :class="activeSettingsTab === 'safety' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              @click="activeSettingsTab = 'safety'"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Shield class="h-4 w-4" />
+                安全与工作区
+              </span>
+            </button>
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
+              :class="activeSettingsTab === 'tools' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              @click="activeSettingsTab = 'tools'"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Wrench class="h-4 w-4" />
+                工具中心
+              </span>
+            </button>
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
               :class="activeSettingsTab === 'providers' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
               @click="activeSettingsTab = 'providers'"
             >
-              模型供应商
+              <span class="inline-flex items-center gap-2">
+                <Sparkles class="h-4 w-4" />
+                模型供应商
+              </span>
             </button>
             <button
-              class="motion-list-item w-full rounded-lg px-3 py-2 text-left text-sm font-medium"
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
               :class="activeSettingsTab === 'debug' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
               @click="activeSettingsTab = 'debug'; loadDebugLogs()"
             >
@@ -1330,12 +4994,556 @@ onBeforeUnmount(() => {
           <div class="flex-1 flex flex-col bg-white overflow-hidden">
             <Transition name="tab-panel" mode="out-in">
               <!-- General Tab -->
-              <div v-if="activeSettingsTab === 'general'" key="general" class="p-6 flex-1 overflow-y-auto custom-scrollbar">
-                <h4 class="text-sm font-semibold text-zinc-800 mb-4">基础配置</h4>
-                <div>
-                  <label class="block text-sm font-medium text-zinc-700 mb-1.5">System Prompt</label>
-                  <p class="text-xs text-zinc-500 mb-3">用于定义 Agent 的默认角色、工具权限边界与输出风格。</p>
-                  <textarea v-model="systemPrompt" rows="6" class="motion-field custom-scrollbar w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"></textarea>
+              <div v-if="activeSettingsTab === 'general'" key="general" class="settings-tab-panel p-4 md:p-6 flex-1 overflow-y-auto custom-scrollbar">
+                <div class="space-y-4">
+                  <div class="preference-card-surface preference-card-surface-compact">
+                    <div class="preference-row preference-row-plain">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">工具轮次上限</span>
+                        <span class="preference-row-hint">默认不限制，开启后按下方数值停止自动链路。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.enableToolRoundLimit }"
+                        @click="appSettingsDraft.enableToolRoundLimit = !appSettingsDraft.enableToolRoundLimit"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row preference-row-plain">
+                      <span class="preference-row-title text-xs font-medium text-zinc-600">最大轮次</span>
+                      <div class="flex items-center gap-3">
+                        <input
+                          v-model.number="appSettingsDraft.maxToolCallRounds"
+                          type="number"
+                          min="1"
+                          :max="MAX_TOOL_CALL_ROUNDS_SAFETY_CAP"
+                          class="motion-field preference-number-input"
+                          :disabled="!appSettingsDraft.enableToolRoundLimit"
+                        />
+                        <span class="settings-status-chip settings-status-chip-muted">
+                          {{ appSettingsDraft.enableToolRoundLimit ? `最多 ${appSettingsDraft.maxToolCallRounds} 轮` : '已关闭限制' }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="preference-stack">
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">流式输出</span>
+                        <span class="preference-row-hint">逐字显示模型回复。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.enableStreamResponse }"
+                        @click="appSettingsDraft.enableStreamResponse = !appSettingsDraft.enableStreamResponse"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">流式自动滚动</span>
+                        <span class="preference-row-hint">流式渲染与工具执行时保持视图贴底。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.autoScrollWhileStreaming }"
+                        @click="appSettingsDraft.autoScrollWhileStreaming = !appSettingsDraft.autoScrollWhileStreaming"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">工具失败即停止</span>
+                        <span class="preference-row-hint">任一工具失败就中止后续工具轮次。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.stopWhenToolError }"
+                        @click="appSettingsDraft.stopWhenToolError = !appSettingsDraft.stopWhenToolError"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">工具结果默认展开</span>
+                        <span class="preference-row-hint">新工具卡自动展开参数与结果。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.autoExpandToolDetails }"
+                        @click="appSettingsDraft.autoExpandToolDetails = !appSettingsDraft.autoExpandToolDetails"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">自动刷新调试日志</span>
+                        <span class="preference-row-hint">每次工具执行完后自动刷新调试面板。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.autoRefreshDebugLogs }"
+                        @click="appSettingsDraft.autoRefreshDebugLogs = !appSettingsDraft.autoRefreshDebugLogs"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row preference-row-wrap">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">发送快捷键</span>
+                        <span class="preference-row-hint">切换 Enter / Ctrl+Enter 发送。</span>
+                      </div>
+                      <div class="preference-segment preference-segment-inline">
+                        <button
+                          type="button"
+                          class="preference-segment-option"
+                          :class="{ 'is-active': appSettingsDraft.composerSendMode === 'enter' }"
+                          @click="appSettingsDraft.composerSendMode = 'enter'"
+                        >
+                          Enter
+                        </button>
+                        <button
+                          type="button"
+                          class="preference-segment-option"
+                          :class="{ 'is-active': appSettingsDraft.composerSendMode === 'ctrlEnter' }"
+                          @click="appSettingsDraft.composerSendMode = 'ctrlEnter'"
+                        >
+                          Ctrl+Enter
+                        </button>
+                      </div>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">从主输入框启动时自动发送</span>
+                        <span class="preference-row-hint">开启后，ZTools 主搜索框传入的文本会直接作为第一条消息发送，而不是先填入对话框。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.launchAutoSend }"
+                        @click="appSettingsDraft.launchAutoSend = !appSettingsDraft.launchAutoSend"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4">
+                    <h4 class="text-sm font-semibold text-zinc-800">系统提示词</h4>
+                    <p class="mt-1.5 text-xs leading-6 text-zinc-500">
+                      定义 Agent 的角色与边界。保存后仅影响后续新对话。
+                    </p>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      <button
+                        v-for="preset in systemPromptPresets"
+                        :key="preset.id"
+                        type="button"
+                        class="motion-surface rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900"
+                        @click="applySystemPromptPreset(preset.prompt)"
+                      >
+                        {{ preset.label }}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                    <div class="flex items-center justify-between gap-3">
+                      <label class="block text-sm font-medium text-zinc-700">提示词内容</label>
+                      <span class="text-xs text-zinc-400">{{ systemPromptDraftLength }} 字</span>
+                    </div>
+                    <textarea
+                      v-model="systemPromptDraft"
+                      rows="8"
+                      class="motion-field custom-scrollbar mt-3 w-full resize-none rounded-2xl border border-zinc-200 bg-zinc-50 p-4 text-sm leading-6 text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                      placeholder="输入系统提示词，用于定义新对话的默认角色、风格与约束。"
+                    ></textarea>
+                    <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+                      <button
+                        type="button"
+                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        @click="resetSystemPromptDraft"
+                      >
+                        恢复默认
+                      </button>
+                      <span
+                        class="rounded-full px-2.5 py-1 text-[11px] font-medium"
+                        :class="hasSystemPromptDraftChanges ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'"
+                      >
+                        {{ hasSystemPromptDraftChanges ? '有未保存修改' : '已同步' }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div
+                    v-if="activeSessionPromptSnapshot"
+                    class="rounded-2xl border border-sky-200 bg-sky-50/70 p-4"
+                  >
+                    <div class="mb-2 text-sm font-medium text-sky-900">当前会话锁定提示词</div>
+                    <pre class="tool-embed-code max-h-[160px] rounded-xl border border-sky-100 bg-white/80"><code>{{ activeSessionPromptSnapshot }}</code></pre>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Safety Tab -->
+              <div v-else-if="activeSettingsTab === 'safety'" key="safety" class="settings-tab-panel p-4 md:p-6 flex-1 overflow-y-auto custom-scrollbar">
+                <div class="space-y-4">
+                  <div class="safety-hero-card">
+                    <div class="safety-hero-icon">
+                      <Shield class="h-5 w-5" />
+                    </div>
+                    <div class="safety-hero-copy">
+                      <h4 class="text-sm font-semibold text-zinc-800">安全执行策略</h4>
+                      <p class="mt-1 text-xs leading-6 text-zinc-500">
+                        控制 AI 在调用 Bash 与文件写入工具时是否需要你确认。调用方必须自评风险等级（low / medium / high），当风险达到当前模式阈值时会弹出审阅弹窗。
+                      </p>
+                    </div>
+                    <span
+                      class="settings-status-chip"
+                      :class="appSettingsDraft.safetyMode === 'loose' ? 'settings-status-chip-pending' : 'settings-status-chip-ready'"
+                    >
+                      当前：{{ getSafetyModeLabel(appSettingsDraft.safetyMode) }}
+                    </span>
+                  </div>
+
+                  <div class="safety-mode-grid">
+                    <button
+                      type="button"
+                      class="safety-mode-card"
+                      :class="{ 'is-active': appSettingsDraft.safetyMode === 'strict' }"
+                      @click="appSettingsDraft.safetyMode = 'strict'"
+                    >
+                      <div class="safety-mode-card-head">
+                        <span class="safety-mode-card-title">严格模式</span>
+                        <span class="safety-mode-card-tag safety-mode-card-tag-strict">最安全</span>
+                      </div>
+                      <p class="safety-mode-card-desc">
+                        每一次 Bash 和文件写入都会弹出审阅。适合第一次使用或关键生产环境。
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      class="safety-mode-card"
+                      :class="{ 'is-active': appSettingsDraft.safetyMode === 'moderate' }"
+                      @click="appSettingsDraft.safetyMode = 'moderate'"
+                    >
+                      <div class="safety-mode-card-head">
+                        <span class="safety-mode-card-title">宽松模式</span>
+                        <span class="safety-mode-card-tag safety-mode-card-tag-moderate">推荐</span>
+                      </div>
+                      <p class="safety-mode-card-desc">
+                        默认拦截 AI 自评为中、高风险的操作；低风险放行。可在下方切换为仅高风险才拦截。
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      class="safety-mode-card"
+                      :class="{ 'is-active': appSettingsDraft.safetyMode === 'loose' }"
+                      @click="appSettingsDraft.safetyMode = 'loose'"
+                    >
+                      <div class="safety-mode-card-head">
+                        <span class="safety-mode-card-title">无视风险</span>
+                        <span class="safety-mode-card-tag safety-mode-card-tag-loose">不推荐</span>
+                      </div>
+                      <p class="safety-mode-card-desc">
+                        AI 所有操作都无需确认，完全自动执行。仅在你对 AI 的行为有充分信任时开启。
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      class="safety-mode-card"
+                      :class="{ 'is-active': appSettingsDraft.safetyMode === 'allowlist' }"
+                      @click="appSettingsDraft.safetyMode = 'allowlist'"
+                    >
+                      <div class="safety-mode-card-head">
+                        <span class="safety-mode-card-title">黑白名单</span>
+                        <span class="safety-mode-card-tag safety-mode-card-tag-allowlist">精细</span>
+                      </div>
+                      <p class="safety-mode-card-desc">
+                        由名单决定是否需要确认。白名单里的直接放行，其他弹确认；黑名单相反。
+                      </p>
+                    </button>
+                  </div>
+
+                  <Transition name="dropdown-fade">
+                    <div v-if="appSettingsDraft.safetyMode === 'moderate'" class="safety-moderate-fine">
+                      <div class="safety-moderate-fine-copy">
+                        <span class="safety-moderate-fine-title">仅高风险时拦截</span>
+                        <span class="safety-moderate-fine-hint">
+                          {{ appSettingsDraft.moderateOnlyHigh
+                            ? '当前：中风险操作会直接放行，只有 AI 自评为高风险时才弹确认。'
+                            : '当前：中风险与高风险都会弹确认，低风险放行。' }}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.moderateOnlyHigh }"
+                        @click="appSettingsDraft.moderateOnlyHigh = !appSettingsDraft.moderateOnlyHigh"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                  </Transition>
+
+                  <Transition name="dropdown-fade">
+                    <div v-if="appSettingsDraft.safetyMode === 'allowlist'" class="allowlist-config">
+                      <section class="allowlist-section">
+                        <header class="allowlist-section-head">
+                          <div>
+                            <h5 class="allowlist-section-title">工具名单</h5>
+                            <span class="allowlist-section-hint">
+                              {{ appSettingsDraft.toolListKind === 'white'
+                                ? '白名单：被选中的工具直接放行，其他工具调用时弹出确认。'
+                                : '黑名单：被选中的工具调用时弹出确认，其他工具直接放行。' }}
+                            </span>
+                          </div>
+                          <div class="preference-segment preference-segment-inline">
+                            <button
+                              type="button"
+                              class="preference-segment-option"
+                              :class="{ 'is-active': appSettingsDraft.toolListKind === 'white' }"
+                              @click="appSettingsDraft.toolListKind = 'white'"
+                            >
+                              白名单
+                            </button>
+                            <button
+                              type="button"
+                              class="preference-segment-option"
+                              :class="{ 'is-active': appSettingsDraft.toolListKind === 'black' }"
+                              @click="appSettingsDraft.toolListKind = 'black'"
+                            >
+                              黑名单
+                            </button>
+                          </div>
+                        </header>
+                        <div class="allowlist-tool-chips">
+                          <button
+                            v-for="tool in toolCatalog"
+                            :key="tool.name"
+                            type="button"
+                            class="allowlist-tool-chip"
+                            :class="{ 'is-active': appSettingsDraft.toolListNames.includes(tool.name) }"
+                            @click="toggleAllowlistToolDraft(tool.name)"
+                          >
+                            <Wrench class="h-3.5 w-3.5" />
+                            <span>{{ tool.label }}</span>
+                          </button>
+                        </div>
+                      </section>
+
+                      <section class="allowlist-section">
+                        <header class="allowlist-section-head">
+                          <div>
+                            <h5 class="allowlist-section-title">Bash 命令名单</h5>
+                            <span class="allowlist-section-hint">
+                              {{ appSettingsDraft.commandListKind === 'white'
+                                ? '白名单：匹配列表的命令直接放行，其他命令弹出确认；在确认弹窗里可以一键加入白名单。'
+                                : '黑名单：匹配列表的命令弹出确认，其他命令直接放行；在确认弹窗里可以一键从黑名单移除。' }}
+                            </span>
+                          </div>
+                          <div class="preference-segment preference-segment-inline">
+                            <button
+                              type="button"
+                              class="preference-segment-option"
+                              :class="{ 'is-active': appSettingsDraft.commandListKind === 'white' }"
+                              @click="appSettingsDraft.commandListKind = 'white'"
+                            >
+                              白名单
+                            </button>
+                            <button
+                              type="button"
+                              class="preference-segment-option"
+                              :class="{ 'is-active': appSettingsDraft.commandListKind === 'black' }"
+                              @click="appSettingsDraft.commandListKind = 'black'"
+                            >
+                              黑名单
+                            </button>
+                          </div>
+                        </header>
+                        <textarea
+                          :value="appSettingsDraft.commandListPatterns.join('\n')"
+                          @input="handleCommandListInput(($event.target as HTMLTextAreaElement).value)"
+                          rows="6"
+                          class="motion-field custom-scrollbar allowlist-command-textarea"
+                          placeholder="每行一条，例如：&#10;git&#10;npm *&#10;rm -rf /"
+                        ></textarea>
+                        <div class="allowlist-command-hint">
+                          <span>匹配规则：</span>
+                          <span>无 <code>*</code> 时按"命令前缀"匹配（如 <code>git</code> 命中所有 git 子命令）；含 <code>*</code> 时按 glob 整行匹配（如 <code>npm install *</code>）。</span>
+                        </div>
+                      </section>
+                    </div>
+                  </Transition>
+
+                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                    <div class="flex items-center gap-2">
+                      <FolderOpen class="h-4 w-4 text-zinc-500" />
+                      <h4 class="text-sm font-semibold text-zinc-800">工作目录</h4>
+                      <span
+                        v-if="!appSettingsDraft.workspaceRoot"
+                        class="settings-status-chip settings-status-chip-pending"
+                      >未设置</span>
+                    </div>
+                    <p class="mt-1 text-xs leading-6 text-zinc-500">
+                      AI 执行相对路径命令与文件操作时的根目录。建议设为项目目录，避免 AI 在系统默认路径（可能是系统盘根或 Program Files）下误操作。
+                    </p>
+                    <div class="mt-3 flex flex-wrap items-stretch gap-2">
+                      <input
+                        v-model.trim="appSettingsDraft.workspaceRoot"
+                        type="text"
+                        class="motion-field h-10 flex-1 min-w-[240px] rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                        placeholder="例如 D:\\编程\\my-project"
+                      />
+                      <button
+                        type="button"
+                        class="motion-surface rounded-xl border border-zinc-200 px-3 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        @click="clearWorkspaceRootDraft"
+                      >
+                        清空
+                      </button>
+                    </div>
+                    <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                      <span class="settings-status-chip settings-status-chip-muted">
+                        当前生效：{{ currentWorkspaceCwd || '（未知）' }}
+                      </span>
+                      <span
+                        v-if="hasWorkspaceDraftChanged"
+                        class="settings-status-chip settings-status-chip-pending"
+                      >保存后生效</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else-if="activeSettingsTab === 'tools'" key="tools" class="settings-tab-panel p-4 md:p-6 flex-1 overflow-y-auto custom-scrollbar">
+                <div class="space-y-4">
+                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 class="text-sm font-semibold text-zinc-800">本地工具总开关</h4>
+                        <p class="mt-1 text-xs leading-6 text-zinc-500">
+                          {{ toolSettingsSummary }} · 已关闭 {{ draftDisabledToolCount }} 个。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.enableLocalTools }"
+                        @click="appSettingsDraft.enableLocalTools = !appSettingsDraft.enableLocalTools"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
+                      <span class="settings-status-chip settings-status-chip-muted">
+                        {{ appSettingsDraft.enableLocalTools ? `草稿启用 ${draftEnabledToolCount} 个工具` : '草稿：全部隐藏' }}
+                      </span>
+                      <button
+                        type="button"
+                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        @click="setAllToolDraftEnabled(true)"
+                      >全部启用</button>
+                      <button
+                        type="button"
+                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        @click="setAllToolDraftEnabled(false)"
+                      >全部关闭</button>
+                      <button
+                        type="button"
+                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        @click="resetToolDraftSelection"
+                      >恢复默认</button>
+                    </div>
+                  </div>
+
+                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 class="text-sm font-semibold text-zinc-800">Tavily 搜索密钥</h4>
+                        <p class="mt-1 text-xs leading-6 text-zinc-500">WebSearchTool 必需。</p>
+                      </div>
+                      <span
+                        class="settings-status-chip"
+                        :class="hasTavilyKeyConfigured ? 'settings-status-chip-ready' : 'settings-status-chip-pending'"
+                      >
+                        {{ hasTavilyKeyConfigured ? '已配置' : '未配置' }}
+                      </span>
+                    </div>
+                    <input
+                      v-model.trim="appSettingsDraft.tavilyApiKey"
+                      type="password"
+                      class="motion-field mt-3 h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                      placeholder="tvly-..."
+                    />
+                  </div>
+
+                  <section
+                    v-for="group in toolCatalogGroups"
+                    :key="group.id"
+                    class="rounded-2xl border border-zinc-200 bg-zinc-50/60 p-4"
+                  >
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 class="text-sm font-semibold text-zinc-800">{{ group.label }}</h4>
+                        <p class="mt-1 text-xs leading-6 text-zinc-500">{{ group.description }}</p>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="settings-status-chip settings-status-chip-muted">
+                          {{ group.enabledCount }}/{{ group.tools.length }}
+                        </span>
+                        <button
+                          type="button"
+                          class="motion-surface rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900"
+                          @click="toggleToolCategoryDraft(group.id)"
+                        >
+                          {{ group.enabledCount === group.tools.length ? '关闭本组' : '启用本组' }}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div class="preference-stack mt-3">
+                      <div
+                        v-for="tool in group.tools"
+                        :key="tool.name"
+                        class="preference-row preference-row-wrap"
+                      >
+                        <div class="preference-row-copy">
+                          <div class="flex flex-wrap items-center gap-2">
+                            <span class="preference-row-title">{{ tool.label }}</span>
+                            <span class="settings-status-chip settings-status-chip-muted">{{ tool.capabilityLabel }}</span>
+                            <span
+                              class="settings-status-chip"
+                              :class="tool.riskLabel === '高风险' ? 'settings-status-chip-pending' : 'settings-status-chip-ready'"
+                            >{{ tool.riskLabel }}</span>
+                          </div>
+                          <span class="preference-row-hint">{{ tool.summary }}</span>
+                        </div>
+                        <button
+                          type="button"
+                          class="preference-toggle"
+                          :class="{ 'is-active': isToolEnabled(tool.name, appSettingsDraft) }"
+                          @click="toggleToolDraft(tool.name)"
+                        >
+                          <span class="preference-toggle-thumb"></span>
+                        </button>
+                      </div>
+                    </div>
+                  </section>
                 </div>
               </div>
 
@@ -1345,9 +5553,17 @@ onBeforeUnmount(() => {
                 <div class="flex w-[220px] flex-col border-r border-zinc-100 bg-zinc-50/50">
                   <div class="flex items-center justify-between border-b border-zinc-100 p-3">
                     <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">供应商列表</span>
-                    <button @click="addNewProvider" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="添加供应商">
-                      <Plus class="h-4 w-4" />
-                    </button>
+                    <div class="flex items-center gap-1">
+                      <button @click="exportProviders" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="导出供应商配置">
+                        <Download class="h-4 w-4" />
+                      </button>
+                      <button @click="importProviders" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="导入供应商配置">
+                        <Upload class="h-4 w-4" />
+                      </button>
+                      <button @click="addNewProvider" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="添加供应商">
+                        <Plus class="h-4 w-4" />
+                      </button>
+                    </div>
                   </div>
                   <div class="custom-scrollbar flex-1 overflow-y-auto p-2 space-y-1">
                     <TransitionGroup name="list-stagger" tag="div" class="space-y-1">
@@ -1388,7 +5604,18 @@ onBeforeUnmount(() => {
                     
                     <div>
                       <label class="block text-sm font-medium text-zinc-700 mb-1.5">API Key</label>
-                      <input v-model="currentProvider.apiKey" type="password" class="motion-field h-9 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100" />
+                      <div class="relative flex items-center">
+                        <input v-model="currentProvider.apiKey" :type="currentProvider.showApiKey ? 'text' : 'password'" class="motion-field h-9 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 pr-10 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100" />
+                        <button
+                          type="button"
+                          class="motion-icon absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-zinc-400 hover:text-zinc-700"
+                          @click="currentProvider.showApiKey = !currentProvider.showApiKey"
+                          :title="currentProvider.showApiKey ? '隐藏密钥' : '显示密钥'"
+                        >
+                          <Eye v-if="!currentProvider.showApiKey" class="h-4 w-4" />
+                          <EyeOff v-else class="h-4 w-4" />
+                        </button>
+                      </div>
                     </div>
 
                     <div>
@@ -1468,7 +5695,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="px-5 py-4 border-t border-zinc-100 bg-zinc-50 flex justify-end gap-3 flex-shrink-0">
-          <button type="button" @click="showSettings = false" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-900">取消</button>
+          <button type="button" @click="closeSettings()" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-900">取消</button>
           <button type="button" @click="saveConfig" class="motion-surface flex items-center gap-2 rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-50 shadow-sm hover:bg-zinc-800">
             <Check class="h-4 w-4" />
             保存配置

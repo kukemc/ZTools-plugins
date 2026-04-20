@@ -6,11 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
+    "test": "node --test tests/*.test.cjs",
     "preview": "vite preview",
     "pack": "node scripts/pack.js && powershell -Command \"cd pack; Compress-Archive -Path * -DestinationPath ../kuke-ai-agent.zip -Force\""
   },
   "dependencies": {
+    "@tavily/core": "^0.5.14",
     "@types/markdown-it": "^14.1.2",
+    "highlight.js": "^11.11.1",
     "lucide-vue-next": "^1.0.0",
     "markdown-it": "^14.1.1",
     "openai": "^6.34.0",

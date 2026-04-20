@@ -1,8 +1,10 @@
 {
   "name": "kuke-ai-agent",
   "title": "Kuke AI Agent",
-  "description": "本地全能 AI Agent，支持操作本地文件与执行终端指令，具备精美动画与自由模型配置。",
+  "description": "本地全能 AI Agent，支持 读写本地文件、执行终端命令、联网搜索、Todo；具备强大的 AI Coding 能力、美观的UI和动效、多种完善的安全机制、审查模式，可自由模型配置，支持主流 OpenAI 兼容模型自由切换。",
   "version": "1.0.0",
+  "author": "kukemc",
+  "homepage": "https://github.com/kukemc",
   "main": "dist/index.html",
   "logo": "logo.png",
   "preload": "preload.js",
@@ -13,7 +15,17 @@
     {
       "code": "chat",
       "explain": "唤起 Kuke Agent",
-      "cmds": ["kuke", "agent", "ai", "chat"]
+      "cmds": ["kuke", "agent", "ai", "chat","询问AI"]
+    },
+    {
+      "code": "quickask",
+      "explain": "快速提问 Kuke Agent",
+      "cmds": [
+        {
+          "type": "over",
+          "label": "询问AI"
+        }
+      ]
     }
   ]
 }

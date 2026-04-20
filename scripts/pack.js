@@ -59,7 +59,8 @@ const prodPkg = {
   version: originalPkg.version,
   type: "commonjs", // 确保 preload.js 能正常使用 require
   dependencies: {
-    openai: originalPkg.dependencies.openai
+    openai: originalPkg.dependencies.openai,
+    "@tavily/core": originalPkg.dependencies["@tavily/core"]
   }
 };
 fs.writeFileSync(path.join(packDir, 'package.json'), JSON.stringify(prodPkg, null, 2));
