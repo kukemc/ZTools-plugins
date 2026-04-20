@@ -2,12 +2,14 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import AdmZip from 'adm-zip';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const rootDir = path.join(__dirname, '..');
 const packDir = path.join(rootDir, 'pack');
+const zipPath = path.join(rootDir, 'kuke-ai-agent.zip');
 
 console.log('开始准备打包环境...');
 
@@ -70,4 +72,9 @@ console.log('生成生产环境 package.json');
 console.log('安装生产依赖...');
 execSync('npm install', { cwd: packDir, stdio: 'inherit' });
 
-console.log('打包环境准备完毕！');
+// 6. Create zip archive (cross-platform)
+console.log('正在创建 zip 包...');
+const zip = AdmZip();
+zip.addLocalFolder(packDir);
+zip.writeZip(zipPath);
+console.log(`打包完成: ${zipPath}`);
