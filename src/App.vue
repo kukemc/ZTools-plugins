@@ -36,6 +36,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  Server,
   Settings,
   Shield,
   Sparkles,
@@ -55,7 +56,8 @@ import type {
   ChangeSummaryFile, ChangeSummary, ChatMessage, Provider, ChatSession,
   DebugLogEntry, SessionRuntimeState, TodoStatus, TodoItem,
   SafetyMode, ToolRiskLevel, AppSettings, ToolCategoryId,
-  ToolConfirmationDecision, PendingToolConfirmation, ToolGateDecision
+  ToolConfirmationDecision, PendingToolConfirmation, ToolGateDecision,
+  DiscoveredSkill
 } from './types'
 
 import {
@@ -92,12 +94,13 @@ const isPlusMenuOpen = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const folderInputRef = ref<HTMLInputElement | null>(null)
 const imageInputRef = ref<HTMLInputElement | null>(null)
+const skillFileInputRef = ref<HTMLInputElement | null>(null)
 const plusMenuRef = ref<HTMLElement | null>(null)
 const messageImagePreview = ref<Record<string, string>>({})
 const imagePreviewLoading = ref<Set<string>>(new Set())
 const manualModelInput = ref('')
 const showSettings = ref(false)
-const activeSettingsTab = ref('tools')
+const activeSettingsTab = ref('general')
 const isSidebarOpen = ref(true)
 const isTodoDrawerOpen = ref(false)
 const isBashShellsOpen = ref(false)
@@ -141,6 +144,212 @@ const currentSessionId = ref('')
 const sessionRuntimeState = ref<Record<string, SessionRuntimeState>>({})
 const debugLogs = ref<DebugLogEntry[]>([])
 const isLoadingDebugLogs = ref(false)
+const discoveredSkills = ref<DiscoveredSkill[]>([])
+const showSkillCreateDialog = ref(false)
+const skillCreateForm = ref({ name: '', description: '', content: '' })
+const showSkillDetailDialog = ref(false)
+const skillDetailContent = ref('')
+const skillDetailName = ref('')
+const isImportingSkill = ref(false)
+const isSavingSkill = ref(false)
+const standardSkillTemplates = ref<Array<{ name: string; description: string }>>([])
+const userHomedir = computed(() => environmentInfo.value.homedir || '')
+
+const refreshDiscoveredSkills = async () => {
+  const discover = (window as any).localTools?.discoverSkills
+  if (typeof discover !== 'function') return
+  try {
+    const response = await discover()
+    if (response?.success && Array.isArray(response.data)) {
+      discoveredSkills.value = response.data
+    }
+  } catch {
+    // ignore
+  }
+}
+
+const openSkillCreateDialog = () => {
+  skillCreateForm.value = { name: '', description: '', content: '' }
+  showSkillCreateDialog.value = true
+}
+
+const closeSkillCreateDialog = () => {
+  showSkillCreateDialog.value = false
+}
+
+const submitSkillCreate = async () => {
+  const { name, description, content } = skillCreateForm.value
+  if (!name.trim() || !description.trim()) {
+    showNotice('名称和描述不能为空', 'error')
+    return
+  }
+  isSavingSkill.value = true
+  try {
+    const saver = (window as any).localTools?.saveSkill
+    if (typeof saver !== 'function') {
+      showNotice('当前环境不支持创建 Skill', 'error')
+      return
+    }
+    const response = await saver({ name: name.trim(), description: description.trim(), content })
+    if (response?.success) {
+      showNotice('Skill 创建成功', 'success')
+      showSkillCreateDialog.value = false
+      await refreshDiscoveredSkills()
+    } else {
+      showNotice(response?.error || '创建失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '创建失败', 'error')
+  } finally {
+    isSavingSkill.value = false
+  }
+}
+
+const removeSkill = async (entry: string) => {
+  const deleter = (window as any).localTools?.deleteSkill
+  if (typeof deleter !== 'function') return
+  try {
+    const response = await deleter({ entry })
+    if (response?.success) {
+      showNotice('Skill 已删除', 'success')
+      await refreshDiscoveredSkills()
+    } else {
+      showNotice(response?.error || '删除失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '删除失败', 'error')
+  }
+}
+
+const viewSkill = async (entry: string, name: string) => {
+  const reader = (window as any).localTools?.readSkillFile
+  if (typeof reader !== 'function') return
+  try {
+    const response = await reader({ entry })
+    if (response?.success) {
+      skillDetailName.value = name
+      skillDetailContent.value = String(response.data ?? '')
+      showSkillDetailDialog.value = true
+    } else {
+      showNotice(response?.error || '读取失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '读取失败', 'error')
+  }
+}
+
+const closeSkillDetailDialog = () => {
+  showSkillDetailDialog.value = false
+}
+
+const loadStandardSkillTemplates = async () => {
+  const lister = (window as any).localTools?.listStandardSkillTemplates
+  if (typeof lister !== 'function') return
+  try {
+    const response = await lister()
+    if (Array.isArray(response)) {
+      standardSkillTemplates.value = response
+    }
+  } catch {
+    // ignore
+  }
+}
+
+const importStandardSkillTemplate = async (name: string) => {
+  isImportingSkill.value = true
+  try {
+    const importer = (window as any).localTools?.importStandardSkill
+    if (typeof importer !== 'function') {
+      showNotice('当前环境不支持导入 Skill', 'error')
+      return
+    }
+    const response = await importer({ name })
+    if (response?.success) {
+      showNotice(`标准 Skill「${name}」导入成功`, 'success')
+      await refreshDiscoveredSkills()
+    } else {
+      showNotice(response?.error || '导入失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '导入失败', 'error')
+  } finally {
+    isImportingSkill.value = false
+  }
+}
+
+const triggerSkillFileImport = () => {
+  skillFileInputRef.value?.click()
+}
+
+const handleSkillFileChange = async (event: Event) => {
+  const target = event.target as HTMLInputElement | null
+  const file = target?.files?.[0]
+  if (!file) return
+  const fileName = file.name
+  const isZip = fileName.toLowerCase().endsWith('.zip')
+  isImportingSkill.value = true
+  target.value = ''
+  try {
+    if (isZip) {
+      const saveToTemp = (window as any).localTools?.saveUploadedFileToTemp
+      const importFromPath = (window as any).localTools?.importSkillFromFilePath
+      if (typeof saveToTemp !== 'function' || typeof importFromPath !== 'function') {
+        showNotice('当前环境不支持导入 ZIP 格式 Skill', 'error')
+        return
+      }
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => {
+          const result = reader.result as ArrayBuffer
+          const bytes = new Uint8Array(result)
+          let binary = ''
+          for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i])
+          }
+          resolve(btoa(binary))
+        }
+        reader.onerror = () => reject(new Error('读取文件失败'))
+        reader.readAsArrayBuffer(file)
+      })
+      const saveResult = await saveToTemp({ content: base64, fileName })
+      if (!saveResult?.success) {
+        showNotice(saveResult?.error || '保存临时文件失败', 'error')
+        return
+      }
+      const response = await importFromPath({ filePath: saveResult.filePath })
+      if (response?.success) {
+        showNotice('本地 Skill 导入成功', 'success')
+        await refreshDiscoveredSkills()
+      } else {
+        showNotice(response?.error || '导入失败', 'error')
+      }
+    } else {
+      const importer = (window as any).localTools?.saveSkillFromContent
+      if (typeof importer !== 'function') {
+        showNotice('当前环境不支持导入本地 Skill', 'error')
+        return
+      }
+      const content = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result ?? ''))
+        reader.onerror = () => reject(new Error('读取文件失败'))
+        reader.readAsText(file)
+      })
+      const response = await importer({ content, fileName })
+      if (response?.success) {
+        showNotice('本地 Skill 导入成功', 'success')
+        await refreshDiscoveredSkills()
+      } else {
+        showNotice(response?.error || '导入失败', 'error')
+      }
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '导入失败', 'error')
+  } finally {
+    isImportingSkill.value = false
+  }
+}
+
 const copiedMessageId = ref<string | null>(null)
 const copiedToolFieldKey = ref<string | null>(null)
 let copiedMessageResetTimer: ReturnType<typeof setTimeout> | undefined
@@ -958,6 +1167,29 @@ const buildPlaceholderValues = (): Record<string, string> => {
     username: resolve('user'),
     nodeVersion: resolve('nodeVersion'),
   }
+}
+
+const buildSkillsBlock = (skills: DiscoveredSkill[]): string => {
+  if (!skills.length) return ''
+  const lines: string[] = []
+  lines.push('<available_skills>')
+  lines.push('你可以按需使用以下 Skill。判断相关后，先用 `cat <entry>` 读取完整指令。')
+  for (const s of skills) {
+    lines.push(`  <skill>`)
+    lines.push(`    <name>${s.name}</name>`)
+    lines.push(`    <description>${s.description}</description>`)
+    lines.push(`    <entry>${s.entry}</entry>`)
+    lines.push(`  </skill>`)
+  }
+  lines.push('</available_skills>')
+  lines.push('')
+  lines.push('使用规则：')
+  lines.push('1. 接到任务后，先判断是否有 Skill 的 description 与任务匹配。')
+  lines.push('2. 若匹配，必须先执行 `cat <entry>` 读取完整 SKILL.md，再按其中步骤操作。')
+  lines.push('3. SKILL.md 可能引用同目录下的其他文件（如 reference.md、forms.md），按需 `cat` 读取，不要一次全读。')
+  lines.push('4. SKILL.md 中声明的脚本优先通过 `bash`/`python` 直接运行，不要把大文件读入上下文。')
+  lines.push('5. 多个 Skill 可组合使用。若都不匹配，按常规方式完成任务。')
+  return lines.join('\n')
 }
 
 const resolveSystemPromptPlaceholders = (raw: string): string => {
@@ -2557,8 +2789,10 @@ const sendMessage = async () => {
   }
   const sessionSystemPrompt = ensureSessionSystemPrompt(sessionId)
   const resolvedSystemPrompt = resolveSystemPromptPlaceholders(sessionSystemPrompt)
+  const skillsBlock = buildSkillsBlock(discoveredSkills.value)
+  const finalSystemPrompt = skillsBlock ? `${resolvedSystemPrompt}\n\n${skillsBlock}` : resolvedSystemPrompt
   const apiMessages: any[] = [
-    { role: 'system', content: resolvedSystemPrompt },
+    { role: 'system', content: finalSystemPrompt },
   ]
   for (const existing of session.messages) {
     if (['system', 'tool'].includes(existing.role)) continue
@@ -2905,6 +3139,18 @@ onMounted(() => {
   }
 
   void applyWorkspaceRootFromSettings()
+
+  try {
+    const discover = (window as any).localTools?.discoverSkills
+    if (typeof discover === 'function') {
+      const response = discover()
+      if (response?.success && Array.isArray(response.data)) {
+        discoveredSkills.value = response.data as DiscoveredSkill[]
+      }
+    }
+  } catch {
+    // best effort
+  }
 
   refreshActiveBashShells()
   bashShellsPollTimer = setInterval(refreshActiveBashShells, 3000)
@@ -3689,6 +3935,13 @@ onBeforeUnmount(() => {
             class="hidden"
             @change="handleImageInputChange"
           />
+          <input
+            ref="skillFileInputRef"
+            type="file"
+            accept=".md,.zip"
+            class="hidden"
+            @change="handleSkillFileChange"
+          />
           <div v-if="isComposerDragActive" class="composer-drop-overlay">
             <Paperclip class="h-5 w-5" />
             <span>松开即附加到消息</span>
@@ -3843,11 +4096,21 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
+              :class="activeSettingsTab === 'skills' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
+              @click="activeSettingsTab = 'skills'; loadStandardSkillTemplates()"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Sparkles class="h-4 w-4" />
+                Skills
+              </span>
+            </button>
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
               :class="activeSettingsTab === 'providers' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'providers'"
             >
               <span class="inline-flex items-center gap-2">
-                <Sparkles class="h-4 w-4" />
+                <Server class="h-4 w-4" />
                 模型供应商
               </span>
             </button>
@@ -4561,6 +4824,137 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+
+              <!-- Skills Tab -->
+              <div v-else-if="activeSettingsTab === 'skills'" key="skills" class="flex flex-1 overflow-hidden">
+                <div class="custom-scrollbar flex-1 overflow-y-auto p-6">
+                  <div class="max-w-2xl space-y-5">
+                    <!-- 已安装 Skills -->
+                    <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
+                      <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h4 class="text-sm font-semibold text-[var(--text)]">已安装 Skills</h4>
+                          <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                            发现 {{ discoveredSkills.length }} 个 Skill，已注入系统提示词。
+                          </p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <button
+                            type="button"
+                            class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] px-3 text-xs text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
+                            @click="refreshDiscoveredSkills"
+                          >
+                            <RefreshCw class="h-3.5 w-3.5" />
+                            刷新
+                          </button>
+                          <button
+                            type="button"
+                            class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--accent)] px-3 text-xs text-[var(--shell-bg)] hover:bg-[var(--accent-strong)]"
+                            @click="openSkillCreateDialog"
+                          >
+                            <Plus class="h-3.5 w-3.5" />
+                            新建 Skill
+                          </button>
+                        </div>
+                      </div>
+
+                      <div class="mt-4 space-y-2">
+                        <div
+                          v-for="skill in discoveredSkills"
+                          :key="skill.entry"
+                          class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-3"
+                        >
+                          <div class="flex flex-wrap items-start justify-between gap-2">
+                            <div class="min-w-0 flex-1">
+                              <div class="flex items-center gap-2">
+                                <span class="text-sm font-medium text-[var(--text)]">{{ skill.name }}</span>
+                                <span class="settings-status-chip settings-status-chip-muted">{{ skill.path.includes(userHomedir) ? '用户级' : '项目级' }}</span>
+                              </div>
+                              <p class="mt-0.5 text-xs text-[var(--text-subtle)]">{{ skill.description }}</p>
+                              <p class="mt-1 text-[11px] font-mono text-[var(--text-subtle)] opacity-70">{{ skill.entry }}</p>
+                            </div>
+                            <div class="flex items-center gap-1">
+                              <button
+                                type="button"
+                                class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]"
+                                title="查看内容"
+                                @click="viewSkill(skill.entry, skill.name)"
+                              >
+                                <Eye class="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                                title="删除"
+                                @click="removeSkill(skill.entry)"
+                              >
+                                <Trash2 class="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        <div v-if="!discoveredSkills.length" class="py-8 text-center text-sm text-[var(--text-subtle)]">
+                          尚未发现任何 Skill。你可以新建 Skill 或从标准库导入。
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- 导入本地 Skill -->
+                    <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
+                      <div class="flex items-center justify-between gap-3">
+                        <div>
+                          <h4 class="text-sm font-semibold text-[var(--text)]">导入本地 Skill</h4>
+                          <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                            从本地文件导入 Skill，支持 .md 文件或包含 SKILL.md 的 .zip 压缩包。
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--accent)] px-3 text-xs text-[var(--shell-bg)] hover:bg-[var(--accent-strong)]"
+                          :disabled="isImportingSkill"
+                          @click="triggerSkillFileImport"
+                        >
+                          <Upload class="h-3.5 w-3.5" />
+                          选择文件
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- 导入标准 Skill -->
+                    <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
+                      <div class="flex items-center justify-between gap-3">
+                        <div>
+                          <h4 class="text-sm font-semibold text-[var(--text)]">导入标准 Skill</h4>
+                          <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                            一键导入常用标准 Skill，安装到用户目录。
+                          </p>
+                        </div>
+                      </div>
+                      <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <div
+                          v-for="template in standardSkillTemplates"
+                          :key="template.name"
+                          class="flex items-center justify-between gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-3"
+                        >
+                          <div class="min-w-0">
+                            <div class="text-sm font-medium text-[var(--text)]">{{ template.name }}</div>
+                            <div class="text-xs text-[var(--text-subtle)] truncate">{{ template.description }}</div>
+                          </div>
+                          <button
+                            type="button"
+                            class="motion-surface shrink-0 rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
+                            :disabled="isImportingSkill"
+                            @click="importStandardSkillTemplate(template.name)"
+                          >
+                            导入
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div v-else key="debug" class="flex h-full flex-col p-6">
                 <div class="mb-4 flex items-center justify-between">
                   <h4 class="text-sm font-semibold text-[var(--text)]">结构化调试日志</h4>
@@ -4615,6 +5009,61 @@ onBeforeUnmount(() => {
           </button>
         </div>
       </div>
+      </div>
+    </Transition>
+
+    <!-- Skill Create Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showSkillCreateDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="closeSkillCreateDialog">
+        <div class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">新建 Skill</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="closeSkillCreateDialog">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="space-y-4 p-5">
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">名称</label>
+              <input v-model.trim="skillCreateForm.name" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="例如：pdf-processing" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">描述</label>
+              <input v-model.trim="skillCreateForm.description" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="简要描述 Skill 的用途和触发场景" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">SKILL.md 内容</label>
+              <textarea v-model="skillCreateForm.content" rows="10" class="motion-field custom-scrollbar w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-3 text-sm font-mono leading-6 text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="输入 SKILL.md 的完整 Markdown 内容。如果内容不包含 YAML frontmatter，系统会自动添加。"></textarea>
+            </div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="closeSkillCreateDialog">取消</button>
+            <button type="button" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)]" :disabled="isSavingSkill" @click="submitSkillCreate">
+              <Check class="h-4 w-4" />
+              保存
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Skill Detail Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showSkillDetailDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="closeSkillDetailDialog">
+        <div class="w-full max-w-2xl rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">{{ skillDetailName }}</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="closeSkillDetailDialog">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="p-5">
+            <pre class="tool-embed-code max-h-[60vh] overflow-y-auto rounded-xl"><code>{{ skillDetailContent }}</code></pre>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="closeSkillDetailDialog">关闭</button>
+          </div>
+        </div>
       </div>
     </Transition>
 

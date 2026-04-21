@@ -198,3 +198,10 @@ export type ToolGateDecision =
       allowlistAction?: 'add_to_white' | 'remove_from_black'
       bashCommand?: string
     }
+
+export interface DiscoveredSkill {
+  name: string
+  description: string
+  path: string
+  entry: string
+}

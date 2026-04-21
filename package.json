@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc -b && vite build",
+    "build": "vue-tsc -b && vite build && npm install --prefix dist",
     "test": "node --test tests/*.test.cjs",
     "preview": "vite preview",
     "pack": "node scripts/pack.js"
@@ -13,6 +13,7 @@
   "dependencies": {
     "@ai-sdk/anthropic": "^0.0.0",
     "@tavily/core": "^0.5.14",
+    "adm-zip": "^0.5.17",
     "highlight.js": "^11.11.1",
     "lucide-vue-next": "^1.0.0",
     "markdown-it": "^14.1.1",
@@ -27,7 +28,6 @@
     "@types/node": "^24.12.2",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/tsconfig": "^0.9.1",
-    "adm-zip": "^0.5.17",
     "autoprefixer": "^10.5.0",
     "postcss": "^8.5.10",
     "tailwindcss": "^4.2.2",

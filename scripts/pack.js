@@ -19,10 +19,11 @@ if (fs.existsSync(packDir)) {
 }
 fs.mkdirSync(packDir, { recursive: true });
 
-// 2. Copy necessary files
+// 2. Copy necessary files from public directory
+const publicDir = path.join(rootDir, 'public');
 const filesToCopy = ['plugin.json', 'preload.js', 'logo.png'];
 for (const file of filesToCopy) {
-  const src = path.join(rootDir, file);
+  const src = path.join(publicDir, file);
   if (fs.existsSync(src)) {
     fs.copyFileSync(src, path.join(packDir, file));
     console.log(`复制文件: ${file}`);
@@ -31,7 +32,7 @@ for (const file of filesToCopy) {
   }
 }
 
-// 3. Copy dist directory
+// 3. Copy dist contents directly to packDir root (no dist/ subfolder)
 const copyRecursiveSync = (src, dest) => {
   if (!fs.existsSync(src)) return;
   const stats = fs.statSync(src);
@@ -47,8 +48,8 @@ const copyRecursiveSync = (src, dest) => {
 
 const distDir = path.join(rootDir, 'dist');
 if (fs.existsSync(distDir)) {
-  copyRecursiveSync(distDir, path.join(packDir, 'dist'));
-  console.log('复制目录: dist');
+  copyRecursiveSync(distDir, packDir);
+  console.log('复制目录: dist 内容到根目录');
 } else {
   console.error('错误: 找不到 dist 目录，请先执行 npm run build');
   process.exit(1);
@@ -65,6 +66,7 @@ const prodPkg = {
     "@tavily/core": originalPkg.dependencies["@tavily/core"],
     "@ai-sdk/anthropic": originalPkg.dependencies["@ai-sdk/anthropic"],
     zod: originalPkg.dependencies.zod,
+    "adm-zip": originalPkg.dependencies["adm-zip"],
   }
 };
 fs.writeFileSync(path.join(packDir, 'package.json'), JSON.stringify(prodPkg, null, 2));

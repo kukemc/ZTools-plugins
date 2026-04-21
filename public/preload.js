@@ -6,9 +6,12 @@ const { exec, spawn } = require('node:child_process');
 const OpenAIImport = require('openai');
 const { tavily } = require('@tavily/core');
 const { AnthropicProvider } = require('@ai-sdk/anthropic');
+let AdmZip = null;
+try { AdmZip = require('adm-zip'); } catch (_) { /* not available */ }
 
 const OpenAIClient = OpenAIImport?.OpenAI || OpenAIImport;
 const MAX_DEBUG_LOGS = 800;
+const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n/;
 
 // Default workspace: plugin-owned folder under user home to avoid polluting project directories
 // Falls back to os.tmpdir() if home is unavailable
@@ -45,6 +48,348 @@ const BASH_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 const BASH_RETURN_BYTE_LIMIT = 40 * 1024;
 const BASH_RETURN_HEAD_LINES = 80;
 const BASH_RETURN_TAIL_LINES = 320;
+
+function parseFrontmatter(content) {
+  const match = content.match(FRONTMATTER_RE);
+  if (!match) return null;
+  const fmText = match[1];
+  const result = {};
+  const lines = fmText.split(/\r?\n/);
+  for (const line of lines) {
+    const colonIndex = line.indexOf(':');
+    if (colonIndex === -1) continue;
+    const key = line.slice(0, colonIndex).trim();
+    let value = line.slice(colonIndex + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key) result[key] = value;
+  }
+  if (!result.name || !result.description) return null;
+  return result;
+}
+
+function discoverSkills() {
+  try {
+    const searchPaths = [
+      path.join(process.cwd(), '.kukeagent', 'skills'),
+      path.join(os.homedir(), '.kukeagent', 'skills'),
+    ];
+    const seen = new Set();
+    const skills = [];
+    for (const basePath of searchPaths) {
+      if (!fs.existsSync(basePath)) continue;
+      const stats = fs.statSync(basePath);
+      if (!stats.isDirectory()) continue;
+      const entries = fs.readdirSync(basePath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillDir = path.join(basePath, entry.name);
+        const skillFile = path.join(skillDir, 'SKILL.md');
+        if (!fs.existsSync(skillFile)) continue;
+        const content = fs.readFileSync(skillFile, 'utf-8');
+        const fm = parseFrontmatter(content);
+        if (!fm) continue;
+        if (seen.has(fm.name)) continue;
+        seen.add(fm.name);
+        skills.push({
+          name: fm.name,
+          description: fm.description,
+          path: skillDir,
+          entry: skillFile,
+        });
+      }
+    }
+    return { success: true, data: skills };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function getUserSkillsDir() {
+  return path.join(os.homedir(), '.kukeagent', 'skills');
+}
+
+function ensureUserSkillsDir() {
+  const dir = getUserSkillsDir();
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+function saveSkill(name, description, content) {
+  try {
+    ensureUserSkillsDir();
+    const skillDir = path.join(getUserSkillsDir(), name);
+    if (!fs.existsSync(skillDir)) {
+      fs.mkdirSync(skillDir, { recursive: true });
+    }
+    const skillFile = path.join(skillDir, 'SKILL.md');
+    const frontmatter = `---\nname: ${name}\ndescription: ${description}\n---\n\n`;
+    const finalContent = String(content ?? '').startsWith('---') ? String(content ?? '') : frontmatter + String(content ?? '');
+    fs.writeFileSync(skillFile, finalContent, 'utf-8');
+    return { success: true, data: { entry: skillFile, name } };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function deleteSkill(entry) {
+  try {
+    const skillDir = path.dirname(entry);
+    fs.rmSync(skillDir, { recursive: true, force: true });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function readSkillFile(entry) {
+  try {
+    const content = fs.readFileSync(entry, 'utf-8');
+    return { success: true, data: content };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+const _pdfSkillContent =
+  '---\n' +
+  'name: pdf-processing\n' +
+  'description: 提取 PDF 文本与表格、填写表单、合并拆分 PDF。当用户需要处理 PDF 文件时使用。关键词：PDF、表单、合并、拆分。\n' +
+  '---\n' +
+  '\n' +
+  '# PDF 处理\n' +
+  '\n' +
+  '## 何时使用\n' +
+  '- 用户上传/提到 PDF 文件并要求提取内容\n' +
+  '- 用户需要填写 PDF 表单\n' +
+  '- 用户需要合并/拆分 PDF\n' +
+  '\n' +
+  '## 操作流程\n' +
+  '\n' +
+  '### 提取文本\n' +
+  '使用 pdftotext（Poppler）或 Python 的 PyPDF2/pypdf：\n' +
+  '```bash\n' +
+  'pdftotext <pdf_path> <output_txt>\n' +
+  '# 或\n' +
+  'python -c "import pypdf; r=pypdf.PdfReader(\'<pdf_path>\'); print(\'\\n\'.join(p.extract_text() for p in r.pages))"\n' +
+  '```\n' +
+  '\n' +
+  '### 提取表单字段\n' +
+  '```bash\n' +
+  'python -c "import pypdf; r=pypdf.PdfReader(\'<pdf_path>\'); print(r.get_fields())"\n' +
+  '```\n' +
+  '\n' +
+  '### 合并文档\n' +
+  '```bash\n' +
+  'python -c "import pypdf; m=pypdf.PdfMerger(); [m.append(f) for f in [\'a.pdf\',\'b.pdf\']]; m.write(\'merged.pdf\')"\n' +
+  '```\n' +
+  '\n' +
+  '### 拆分页面\n' +
+  '```bash\n' +
+  'python -c "import pypdf; r=pypdf.PdfReader(\'input.pdf\'); [pypdf.PdfWriter().add_page(p).write(f\'page_{i}.pdf\') for i,p in enumerate(r.pages)]"\n' +
+  '```\n' +
+  '\n' +
+  '## 输出格式\n' +
+  '统一返回 JSON，包含 `status`、`output_path`、`errors` 三个字段。';
+
+const _excelSkillContent =
+  '---\n' +
+  'name: excel-processing\n' +
+  'description: 读取、写入、转换 Excel/CSV 文件。处理表格数据、公式、筛选与透视。关键词：Excel、CSV、表格、xlsx。\n' +
+  '---\n' +
+  '\n' +
+  '# Excel 处理\n' +
+  '\n' +
+  '## 何时使用\n' +
+  '- 用户需要读取 .xlsx/.xls/.csv 内容\n' +
+  '- 用户需要修改、创建电子表格\n' +
+  '- 用户需要转换格式（Excel 与 CSV 互转）\n' +
+  '\n' +
+  '## 操作流程\n' +
+  '\n' +
+  '### 读取 Excel\n' +
+  '```bash\n' +
+  'python -c "import pandas as pd; df=pd.read_excel(\'<file>\'); print(df.to_string())"\n' +
+  '```\n' +
+  '\n' +
+  '### 读取 CSV\n' +
+  '```bash\n' +
+  'python -c "import pandas as pd; df=pd.read_csv(\'<file>\'); print(df.to_string())"\n' +
+  '```\n' +
+  '\n' +
+  '### 写入 Excel\n' +
+  '```bash\n' +
+  'python -c "import pandas as pd; df=pd.DataFrame(...); df.to_excel(\'output.xlsx\', index=False)"\n' +
+  '```\n' +
+  '\n' +
+  '### Excel 转 CSV\n' +
+  '```bash\n' +
+  'python -c "import pandas as pd; pd.read_excel(\'<file>\').to_csv(\'output.csv\', index=False)"\n' +
+  '```\n' +
+  '\n' +
+  '## 注意事项\n' +
+  '- 大文件优先用 pandas 的 chunksize 参数分块读取\n' +
+  '- 含合并单元格的文件需要特殊处理';
+
+const _imageSkillContent =
+  '---\n' +
+  'name: image-processing\n' +
+  'description: 图片格式转换、压缩、裁剪、调整大小、提取 EXIF 信息。关键词：图片、图像、转换、压缩、裁剪。\n' +
+  '---\n' +
+  '\n' +
+  '# 图片处理\n' +
+  '\n' +
+  '## 何时使用\n' +
+  '- 用户需要转换图片格式（PNG/JPG/WebP 互转）\n' +
+  '- 用户需要压缩、裁剪、调整图片尺寸\n' +
+  '- 用户需要提取图片 EXIF 元数据\n' +
+  '\n' +
+  '## 操作流程\n' +
+  '\n' +
+  '### 格式转换 / 压缩\n' +
+  '```bash\n' +
+  'python -c "from PIL import Image; img=Image.open(\'input.png\'); img.save(\'output.jpg\', quality=85)"\n' +
+  '```\n' +
+  '\n' +
+  '### 调整尺寸\n' +
+  '```bash\n' +
+  'python -c "from PIL import Image; img=Image.open(\'input.jpg\'); img.resize((800,600)).save(\'resized.jpg\')"\n' +
+  '```\n' +
+  '\n' +
+  '### 提取 EXIF\n' +
+  '```bash\n' +
+  'python -c "from PIL import Image; from PIL.ExifTags import TAGS; img=Image.open(\'input.jpg\'); exif=img._getexif(); print({TAGS.get(k):v for k,v in exif.items()}) if exif else print(\'无 EXIF\')"\n' +
+  '```\n' +
+  '\n' +
+  '### 批量处理\n' +
+  '```bash\n' +
+  'python -c "from PIL import Image; import glob; [Image.open(f).convert(\'RGB\').save(f.replace(\'.png\',\'.jpg\'), quality=85) for f in glob.glob(\'*.png\')]"\n' +
+  '```';
+
+const _webScrapingSkillContent =
+  '---\n' +
+  'name: web-scraping\n' +
+  'description: 抓取网页结构化数据、解析 HTML、提取表格与列表。关键词：爬虫、抓取、HTML、解析、数据提取。\n' +
+  '---\n' +
+  '\n' +
+  '# 网页抓取\n' +
+  '\n' +
+  '## 何时使用\n' +
+  '- 用户需要从网页提取结构化数据\n' +
+  '- 用户需要批量抓取表格、列表、文章\n' +
+  '- WebFetchTool 无法满足复杂解析需求时\n' +
+  '\n' +
+  '## 操作流程\n' +
+  '\n' +
+  '### 安装依赖\n' +
+  '```bash\n' +
+  'pip install beautifulsoup4 requests lxml -q\n' +
+  '```\n' +
+  '\n' +
+  '### 抓取并解析\n' +
+  '```bash\n' +
+  'python -c "import requests; from bs4 import BeautifulSoup; url=\'https://example.com\'; resp=requests.get(url,timeout=30); soup=BeautifulSoup(resp.text,\'lxml\'); titles=[a.get_text(strip=True) for a in soup.find_all(\'a\')]; print(titles)"\n' +
+  '```\n' +
+  '\n' +
+  '### 提取表格\n' +
+  '```bash\n' +
+  'python -c "import requests; import pandas as pd; url=\'https://example.com/page-with-table\'; html=requests.get(url).text; tables=pd.read_html(html); print(tables[0].to_string())"\n' +
+  '```\n' +
+  '\n' +
+  '## 注意事项\n' +
+  '- 遵守网站的 robots.txt 和速率限制\n' +
+  '- 使用合适的 User-Agent';
+
+const STANDARD_SKILLS_TEMPLATES = {
+  'pdf-processing': {
+    name: 'pdf-processing',
+    description: '提取 PDF 文本与表格、填写表单、合并拆分 PDF。当用户需要处理 PDF 文件时使用。关键词：PDF、表单、合并、拆分。',
+    content: _pdfSkillContent,
+  },
+  'excel-processing': {
+    name: 'excel-processing',
+    description: '读取、写入、转换 Excel/CSV 文件。处理表格数据、公式、筛选与透视。关键词：Excel、CSV、表格、xlsx。',
+    content: _excelSkillContent,
+  },
+  'image-processing': {
+    name: 'image-processing',
+    description: '图片格式转换、压缩、裁剪、调整大小、提取 EXIF 信息。关键词：图片、图像、转换、压缩、裁剪。',
+    content: _imageSkillContent,
+  },
+  'web-scraping': {
+    name: 'web-scraping',
+    description: '抓取网页结构化数据、解析 HTML、提取表格与列表。关键词：爬虫、抓取、HTML、解析、数据提取。',
+    content: _webScrapingSkillContent,
+  },
+};
+
+function importStandardSkill(name) {
+  try {
+    const template = STANDARD_SKILLS_TEMPLATES[name];
+    if (!template) {
+      return { success: false, error: `未找到标准 Skill：${name}` };
+    }
+    return saveSkill(template.name, template.description, template.content);
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function listStandardSkillTemplates() {
+  return Object.keys(STANDARD_SKILLS_TEMPLATES).map((key) => {
+    const t = STANDARD_SKILLS_TEMPLATES[key];
+    return { name: t.name, description: t.description };
+  });
+}
+
+function importSkillFromZip(zipPath) {
+  if (!AdmZip) return { success: false, error: 'adm-zip 不可用，请检查插件依赖安装' };
+  try {
+    const zip = new AdmZip(zipPath);
+    const entries = zip.getEntries();
+    let skillMdEntry = null;
+    for (const entry of entries) {
+      if (!entry.isDirectory && entry.entryName.toUpperCase() === 'SKILL.MD') {
+        skillMdEntry = entry;
+        break;
+      }
+    }
+    if (!skillMdEntry) {
+      return { success: false, error: 'ZIP 中未找到 SKILL.md 文件' };
+    }
+    const content = zip.readAsText(skillMdEntry);
+    const fm = parseFrontmatter(content);
+    if (!fm || !fm.name) {
+      return { success: false, error: 'SKILL.md 缺少 YAML frontmatter 或 name 字段' };
+    }
+    return saveSkill(fm.name, fm.description || '', content);
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function importSkillFromFilePath(filePath) {
+  try {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.zip') {
+      return importSkillFromZip(filePath);
+    }
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const fm = parseFrontmatter(content);
+    if (!fm || !fm.name) {
+      return { success: false, error: '文件缺少 YAML frontmatter 或 name 字段' };
+    }
+    return saveSkill(fm.name, fm.description || '', content);
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
 
 function trimBashOutput(rawText, channel = 'output') {
   if (typeof rawText !== 'string' || !rawText) {
@@ -3641,6 +3986,66 @@ window.localTools = {
     debugLogs.splice(0, debugLogs.length);
     appendDebugLog('debug', 'cleared', {}, 'info');
     return { success: true };
+  },
+
+  discoverSkills,
+  saveSkill: (options) => {
+    const name = String(options?.name ?? '').trim();
+    const description = String(options?.description ?? '').trim();
+    const content = String(options?.content ?? '');
+    if (!name) return { success: false, error: 'name 不能为空' };
+    if (!description) return { success: false, error: 'description 不能为空' };
+    return saveSkill(name, description, content);
+  },
+  saveSkillFromContent: (options) => {
+    const content = String(options?.content ?? '');
+    const fileName = String(options?.fileName ?? '').trim();
+    if (!content) return { success: false, error: '文件内容不能为空' };
+    try {
+      const fm = parseFrontmatter(content);
+      if (!fm || !fm.name) {
+        return { success: false, error: '文件缺少 YAML frontmatter 或 name 字段' };
+      }
+      return saveSkill(fm.name, fm.description || '', content);
+    } catch (error) {
+      return { success: false, error: safeErrorMessage(error) };
+    }
+  },
+  deleteSkill: (options) => {
+    const entry = String(options?.entry ?? '');
+    if (!entry) return { success: false, error: 'entry 不能为空' };
+    return deleteSkill(entry);
+  },
+  readSkillFile: (options) => {
+    const entry = String(options?.entry ?? '');
+    if (!entry) return { success: false, error: 'entry 不能为空' };
+    return readSkillFile(entry);
+  },
+  importStandardSkill: (options) => {
+    const name = String(options?.name ?? '').trim();
+    if (!name) return { success: false, error: 'name 不能为空' };
+    return importStandardSkill(name);
+  },
+  listStandardSkillTemplates,
+  importSkillFromFilePath: (options) => {
+    const filePath = String(options?.filePath ?? '').trim();
+    if (!filePath) return { success: false, error: 'filePath 不能为空' };
+    return importSkillFromFilePath(filePath);
+  },
+  saveUploadedFileToTemp: (options) => {
+    try {
+      const base64Content = String(options?.content ?? '');
+      const fileName = String(options?.fileName ?? 'upload').trim();
+      if (!base64Content) return { success: false, error: 'content 不能为空' };
+      const buffer = Buffer.from(base64Content, 'base64');
+      const tmpDir = os.tmpdir();
+      const uniqueName = `skill_import_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${fileName}`;
+      const filePath = path.join(tmpDir, uniqueName);
+      fs.writeFileSync(filePath, buffer);
+      return { success: true, filePath };
+    } catch (error) {
+      return { success: false, error: safeErrorMessage(error) };
+    }
   },
 
   getEnvironment: () => {
