@@ -59,10 +59,12 @@ const originalPkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'
 const prodPkg = {
   name: originalPkg.name,
   version: originalPkg.version,
-  type: "commonjs", // 确保 preload.js 能正常使用 require
+  type: "commonjs",
   dependencies: {
     openai: originalPkg.dependencies.openai,
-    "@tavily/core": originalPkg.dependencies["@tavily/core"]
+    "@tavily/core": originalPkg.dependencies["@tavily/core"],
+    "@ai-sdk/anthropic": originalPkg.dependencies["@ai-sdk/anthropic"],
+    zod: originalPkg.dependencies.zod,
   }
 };
 fs.writeFileSync(path.join(packDir, 'package.json'), JSON.stringify(prodPkg, null, 2));

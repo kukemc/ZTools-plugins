@@ -11,17 +11,19 @@
     "pack": "node scripts/pack.js"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^0.0.0",
     "@tavily/core": "^0.5.14",
-    "@types/markdown-it": "^14.1.2",
     "highlight.js": "^11.11.1",
     "lucide-vue-next": "^1.0.0",
     "markdown-it": "^14.1.1",
     "openai": "^6.34.0",
-    "vue": "^3.5.32"
+    "vue": "^3.5.32",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4.2.2",
+    "@types/markdown-it": "^14.1.2",
     "@types/node": "^24.12.2",
     "@vitejs/plugin-vue": "^6.0.5",
     "@vue/tsconfig": "^0.9.1",

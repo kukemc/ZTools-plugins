@@ -5,6 +5,7 @@ const { fileURLToPath } = require('node:url');
 const { exec, spawn } = require('node:child_process');
 const OpenAIImport = require('openai');
 const { tavily } = require('@tavily/core');
+const { AnthropicProvider } = require('@ai-sdk/anthropic');
 
 const OpenAIClient = OpenAIImport?.OpenAI || OpenAIImport;
 const MAX_DEBUG_LOGS = 800;
@@ -173,6 +174,21 @@ function createOpenAIClient(config = {}) {
     baseURL: config.baseURL,
     dangerouslyAllowBrowser: true,
   });
+}
+
+function createAnthropicClient(config = {}) {
+  const provider = new AnthropicProvider({
+    apiKey: config.apiKey || 'empty',
+  });
+  return provider;
+}
+
+function getClient(config = {}) {
+  const type = config.providerType || 'openai';
+  if (type === 'anthropic') {
+    return createAnthropicClient(config);
+  }
+  return createOpenAIClient(config);
 }
 
 function emitChatEvent(handlers, event) {
@@ -445,7 +461,6 @@ function isAbortError(error) {
 }
 
 async function createChatResponse(
-  openai,
   config,
   messages,
   tools,
@@ -453,14 +468,23 @@ async function createChatResponse(
   traceId = createTraceId('chat'),
   signal,
 ) {
+  const providerType = config.providerType || 'openai';
   const useStream = typeof handlers.onEvent === 'function';
+
   appendDebugLog('chat', 'request_start', {
     traceId,
     model: config?.model,
     messageCount: Array.isArray(messages) ? messages.length : 0,
     toolCount: Array.isArray(tools) ? tools.length : 0,
     stream: useStream,
+    providerType,
   });
+
+  if (providerType === 'anthropic') {
+    return createAnthropicChatResponse(config, messages, tools, handlers, traceId, signal);
+  }
+
+  const openai = createOpenAIClient(config);
 
   if (!useStream) {
     const response = await openai.chat.completions.create({
@@ -495,7 +519,7 @@ async function createChatResponse(
     tool_calls: [],
   };
 
-var contentDeltaCount = 0;
+  var contentDeltaCount = 0;
   var toolDeltaCount = 0;
   var finishReason = null;
 
@@ -539,22 +563,16 @@ var contentDeltaCount = 0;
     }
   }
 
-  // After streaming completes, check for text-based tool calls in the content.
-  // Some models (e.g. Minimax, Anthropic legacy) emit tool calls as XML text
-  // rather than structured tool_calls. Also handle cases where structured
-  // tool_calls are present but malformed (missing function.name or function.arguments).
   var hasMalformedToolCalls = false;
   if (finalMessage.tool_calls.length > 0) {
     for (var mti = 0; mti < finalMessage.tool_calls.length; mti++) {
       var tc = finalMessage.tool_calls[mti];
       if (tc === null || tc === undefined) {
         hasMalformedToolCalls = true;
-        appendDebugLog('chat.stream', 'malformed_tool_call_detected', { index: mti, reason: 'null_entry', toolCall: null });
         break;
       }
       if (!tc.function || !tc.function.name || tc.function.name === '') {
         hasMalformedToolCalls = true;
-        appendDebugLog('chat.stream', 'malformed_tool_call_detected', { index: mti, reason: 'empty_function_name', toolCall: JSON.stringify(tc).substring(0, 200) });
         break;
       }
     }
@@ -565,7 +583,6 @@ var contentDeltaCount = 0;
     parsed = parseTextBasedToolCalls(finalMessage.content || '');
     if (parsed && parsed.toolCalls.length > 0) {
       if (hasMalformedToolCalls) {
-        appendDebugLog('chat.stream', 'text_tool_calls_replace_malformed', { oldCount: finalMessage.tool_calls.length, newCount: parsed.toolCalls.length });
         finalMessage.tool_calls = parsed.toolCalls;
       } else {
         finalMessage.tool_calls = parsed.toolCalls;
@@ -586,7 +603,6 @@ var contentDeltaCount = 0;
     finalMessage.content = null;
   }
 
-  // Emit finish event after all post-processing
   if (finishReason) {
     emitChatEvent(handlers, { type: 'finish', finishReason });
   }
@@ -601,6 +617,187 @@ var contentDeltaCount = 0;
   });
 
   return normalizeAssistantMessage(finalMessage);
+}
+
+async function createAnthropicChatResponse(
+  config,
+  messages,
+  tools,
+  handlers = {},
+  traceId = createTraceId('chat'),
+  signal,
+) {
+  const provider = createAnthropicClient(config);
+  const model = provider.chat(config.model);
+  const useStream = typeof handlers.onEvent === 'function';
+
+  const anthropicTools = tools && tools.length > 0 ? convertToolsToAnthropic(tools) : null;
+
+  const requestOptions = {
+    messages: convertMessagesToAnthropic(messages),
+    max_tokens: 4096,
+  };
+
+  if (anthropicTools) {
+    requestOptions.tools = anthropicTools;
+  }
+
+  if (useStream) {
+    requestOptions.stream = true;
+  }
+
+  const response = await model.generate(requestOptions);
+
+  if (!useStream) {
+    const content = response.content;
+    const finishReason = response.stop_reason;
+
+    appendDebugLog('chat', 'request_finish', {
+      traceId,
+      mode: 'non_stream',
+      providerType: 'anthropic',
+      finishReason,
+    });
+
+    return convertAnthropicResponseToAssistant(content, finishReason);
+  }
+
+  const finalMessage = {
+    role: 'assistant',
+    content: '',
+    tool_calls: [],
+  };
+
+  var contentDeltaCount = 0;
+  var toolDeltaCount = 0;
+  var finishReason = null;
+
+  for await (const chunk of response) {
+    if (signal?.aborted) {
+      const abortError = new Error('request aborted');
+      abortError.name = 'AbortError';
+      throw abortError;
+    }
+
+    if (chunk.type === 'content_delta') {
+      const deltaText = typeof chunk.text === 'string' ? chunk.text : '';
+      if (deltaText) {
+        contentDeltaCount += 1;
+        finalMessage.content += deltaText;
+        emitChatEvent(handlers, { type: 'content_delta', delta: deltaText });
+      }
+    }
+
+    if (chunk.type === 'tool_use') {
+      const toolCallDelta = {
+        index: toolDeltaCount,
+        id: chunk.id,
+        type: 'function',
+        function: {
+          name: chunk.name,
+          arguments: '',
+        },
+      };
+      mergeToolCallDelta(finalMessage, toolCallDelta);
+      toolDeltaCount += 1;
+    }
+
+    if (chunk.type === 'tool_result') {
+      // Tool result, no delta needed
+    }
+
+    if (chunk.type === 'message_delta') {
+      if (chunk.delta?.stop_reason) {
+        finishReason = chunk.delta.stop_reason;
+      }
+    }
+  }
+
+  if (finalMessage.tool_calls.length && !finalMessage.content?.trim?.()) {
+    finalMessage.content = null;
+  }
+
+  if (finishReason) {
+    emitChatEvent(handlers, { type: 'finish', finishReason });
+  }
+
+  appendDebugLog('chat', 'request_finish', {
+    traceId,
+    mode: 'stream',
+    providerType: 'anthropic',
+    contentDeltaCount,
+    toolDeltaCount,
+    finalToolCalls: finalMessage.tool_calls.length,
+    finishReason,
+  });
+
+  return normalizeAssistantMessage(finalMessage);
+}
+
+function convertMessagesToAnthropic(messages) {
+  const result = [];
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      result.push({ role: 'user', content: msg.content });
+    } else {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
+function convertToolsToAnthropic(tools) {
+  return tools.map(tool => {
+    const properties = {};
+    const required = [];
+    if (tool.parameters?.properties) {
+      for (const [name, prop] of Object.entries(tool.parameters.properties)) {
+        properties[name] = {
+          type: prop.type || 'string',
+          description: prop.description || '',
+        };
+        if (tool.parameters.required?.includes(name)) {
+          required.push(name);
+        }
+      }
+    }
+    return {
+      name: tool.name,
+      description: tool.description || '',
+      input_schema: {
+        type: 'object',
+        properties,
+        required,
+      },
+    };
+  });
+}
+
+function convertAnthropicResponseToAssistant(content, finishReason) {
+  const blocks = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+  let textContent = '';
+  const toolCalls = [];
+
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      textContent += block.text || '';
+    } else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: block.id,
+        type: 'function',
+        function: {
+          name: block.name,
+          arguments: block.input ? JSON.stringify(block.input) : '{}',
+        },
+      });
+    }
+  }
+
+  return {
+    role: 'assistant',
+    content: textContent || null,
+    tool_calls: toolCalls,
+  };
 }
 
 function normalizeHttpUrl(rawUrl) {
@@ -2798,9 +2995,7 @@ window.localTools = {
     const controller = new AbortController();
     activeChatControllers.set(requestId, controller);
     try {
-      const openai = createOpenAIClient(config);
       const response = await createChatResponse(
-        openai,
         config,
         messages,
         tools,
@@ -2841,6 +3036,23 @@ window.localTools = {
   getModels: async (config) => {
     const traceId = createTraceId('models');
     const startAt = now();
+    const providerType = config?.providerType || 'openai';
+
+    if (providerType === 'anthropic') {
+      const models = [
+        'claude-3-5-haiku-20241017',
+        'claude-3-5-sonnet-20241022',
+        'claude-3-opus-20240229',
+      ];
+      appendDebugLog('models', 'success', {
+        traceId,
+        providerType,
+        durationMs: now() - startAt,
+        total: models.length,
+      });
+      return { success: true, data: models.map(id => ({ id })) };
+    }
+
     try {
       const openai = createOpenAIClient(config);
       const response = await openai.models.list();

@@ -1,5 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+
+// Dark mode detection
+const isDark = computed(() => {
+  if (appSettings.value.darkMode === 'dark') return true
+  if (appSettings.value.darkMode === 'light') return false
+  // auto mode
+  const ztools = (window as any).ztools
+  if (typeof ztools?.isDarkColors === 'function') {
+    return ztools.isDarkColors()
+  }
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+})
 import {
   Activity,
   AlertTriangle,
@@ -36,1116 +48,41 @@ import {
   PanelLeftClose,
   PanelLeftOpen
 } from 'lucide-vue-next'
-import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js/lib/common'
 
-const escapeHtml = (value: string) =>
-  value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
+import type {
+  MessageRole, ToolInvocationStatus, AttachmentKind, Attachment,
+  ToolInvocation, TextMessageBlock,
+  ChangeSummaryFile, ChangeSummary, ChatMessage, Provider, ChatSession,
+  DebugLogEntry, SessionRuntimeState, TodoStatus, TodoItem,
+  SafetyMode, ToolRiskLevel, AppSettings, ToolCategoryId,
+  ToolConfirmationDecision, PendingToolConfirmation, ToolGateDecision
+} from './types'
+
+import {
+  toolCategories, toolCatalog, toolCatalogMap, getDefaultEnabledToolNames,
+  FILE_MUTATING_TOOLS, MUTATING_TOOL_NAMES
+} from './toolCatalog'
+
+import { md } from './utils/markdown'
+
+import {
+  createMessageId, createBlockId, normalizeToolDiff,
+  cloneToolInvocation,
+  cloneMessageBlocks,
+  syncAssistantMessageState,
+  serializeAttachmentForStorage, cloneAttachments,
+  createMessage, normalizeMessages, tryParseJson,
+  getArgumentByAliases, stringifyArgument, stringifyForBlock, isToolResultError
+} from './utils/normalize'
+
+import {
+  MAX_TOOL_CALL_ROUNDS_SAFETY_CAP,
+  clampToolRoundLimit,
+  cloneAppSettings,
+  normalizeAppSettings, createDefaultProviders,
+  defaultSystemPrompt, systemPromptPresets, loadProviders, loadAppSettings
+} from './utils/storage'
 
-const renderHighlightedCode = (code: string, lang: string) => {
-  const language = String(lang || '').trim().toLowerCase()
-  let highlighted = ''
-  let displayLanguage = language || 'text'
-  try {
-    if (language && hljs.getLanguage(language)) {
-      highlighted = hljs.highlight(code, { language, ignoreIllegals: true }).value
-    } else if (language) {
-      highlighted = escapeHtml(code)
-    } else {
-      const auto = hljs.highlightAuto(code)
-      highlighted = auto.value || escapeHtml(code)
-      displayLanguage = auto.language || 'text'
-    }
-  } catch {
-    highlighted = escapeHtml(code)
-  }
-  const encoded = encodeURIComponent(code)
-  const safeLang = escapeHtml(displayLanguage)
-  return `<div class="md-code-block"><div class="md-code-header"><span class="md-code-lang">${safeLang}</span><button type="button" class="md-code-copy" data-code="${encoded}" aria-label="复制代码"><span class="md-code-copy-icon" aria-hidden="true"></span><span class="md-code-copy-label">复制</span></button></div><pre class="md-code-pre hljs"><code class="hljs language-${safeLang}">${highlighted}</code></pre></div>`
-}
-
-const md = new MarkdownIt({
-  breaks: true,
-  linkify: true,
-})
-
-md.renderer.rules.fence = (tokens, idx) => {
-  const token = tokens[idx]
-  const info = token.info ? token.info.trim() : ''
-  const langName = info ? info.split(/\s+/)[0] : ''
-  return `${renderHighlightedCode(token.content, langName)}\n`
-}
-
-md.renderer.rules.code_block = (tokens, idx) => {
-  const token = tokens[idx]
-  return `${renderHighlightedCode(token.content, '')}\n`
-}
-
-type MessageRole = 'assistant' | 'user' | 'system' | 'tool'
-
-type ToolInvocationStatus = 'draft' | 'pending' | 'running' | 'success' | 'error'
-
-type AttachmentKind = 'image' | 'file' | 'folder'
-
-interface Attachment {
-  id: string
-  kind: AttachmentKind
-  name: string
-  path: string
-  size?: number
-  mimeType?: string
-  previewDataUrl?: string
-}
-
-interface ToolDiff {
-  filePath?: string
-  addedLines: number
-  removedLines: number
-  diffText: string
-  tooLarge?: boolean
-  diffTruncated?: boolean
-}
-
-interface ToolInvocation {
-  id: string
-  callId: string
-  name: string
-  argumentsText: string
-  resultText: string
-  status: ToolInvocationStatus
-  expanded: boolean
-  diff?: ToolDiff | null
-}
-
-interface TextMessageBlock {
-  id: string
-  type: 'text'
-  content: string
-}
-
-interface ToolMessageBlock {
-  id: string
-  type: 'tool'
-  toolInvocation: ToolInvocation
-}
-
-type AssistantMessageBlock = TextMessageBlock | ToolMessageBlock
-
-interface ChangeSummaryFile {
-  path: string
-  added: number
-  removed: number
-  kind: string
-}
-
-interface ChangeSummary {
-  files: ChangeSummaryFile[]
-  addedLines: number
-  removedLines: number
-}
-
-interface ChatMessage {
-  id: string
-  role: MessageRole
-  content: string
-  createdAt: number
-  isStreaming?: boolean
-  toolInvocations: ToolInvocation[]
-  blocks: AssistantMessageBlock[]
-  attachments?: Attachment[]
-  hasSnapshot?: boolean
-  changeSummary?: ChangeSummary | null
-}
-
-interface Provider {
-  id: string
-  name: string
-  baseURL: string
-  apiKey: string
-  models: string[]
-  showApiKey?: boolean
-}
-
-interface ChatSession {
-  id: string
-  title: string
-  messages: ChatMessage[]
-  updatedAt: number
-  systemPromptSnapshot?: string
-  titleGenerated?: boolean
-}
-
-interface DebugLogEntry {
-  id: string
-  ts: string
-  level: 'info' | 'error'
-  scope: string
-  event: string
-  payload: Record<string, unknown>
-}
-
-interface SessionRuntimeState {
-  isLoading: boolean
-  activeRequestId: string | null
-  stopRequested: boolean
-  todos: TodoItem[]
-  todosUpdatedAt: number
-}
-
-type TodoStatus = 'pending' | 'in_progress' | 'completed'
-
-interface TodoItem {
-  content: string
-  activeForm: string
-  status: TodoStatus
-}
-
-type ComposerSendMode = 'enter' | 'ctrlEnter'
-
-type SafetyMode = 'strict' | 'moderate' | 'loose' | 'allowlist'
-
-type ToolRiskLevel = 'low' | 'medium' | 'high'
-
-type AllowListKind = 'white' | 'black'
-
-interface AppSettings {
-  enableToolRoundLimit: boolean
-  maxToolCallRounds: number
-  composerSendMode: ComposerSendMode
-  autoExpandToolDetails: boolean
-  autoRefreshDebugLogs: boolean
-  enableStreamResponse: boolean
-  autoScrollWhileStreaming: boolean
-  enableLocalTools: boolean
-  enabledToolNames: string[]
-  tavilyApiKey: string
-  stopWhenToolError: boolean
-  safetyMode: SafetyMode
-  moderateOnlyHigh: boolean
-  toolListKind: AllowListKind
-  toolListNames: string[]
-  commandListKind: AllowListKind
-  commandListPatterns: string[]
-  workspaceRoot: string
-  launchAutoSend: boolean
-}
-
-type ToolCategoryId = 'environment' | 'file' | 'task'
-
-interface ToolDefinitionSchema {
-  type: 'object'
-  properties: Record<string, unknown>
-  required?: string[]
-}
-
-interface ToolDefinition {
-  name: string
-  label: string
-  purpose: string
-  summary: string
-  category: ToolCategoryId
-  categoryLabel: string
-  capabilityLabel: string
-  riskLabel: string
-  description: string
-  parameters: ToolDefinitionSchema
-  legacyNames?: string[]
-}
-
-const toolCategories = [
-  {
-    id: 'environment' as const,
-    label: '环境与联网工具',
-    description: '执行命令、抓取网页、联网搜索，帮助 Agent 探测外部环境。',
-  },
-  {
-    id: 'file' as const,
-    label: '文件工具',
-    description: '读、写、改、删、检索本地文件与 Jupyter notebook，覆盖日常代码与文档工作。',
-  },
-  {
-    id: 'task' as const,
-    label: '任务与计划',
-    description: '让模型显式规划步骤并实时更新进度，用于复杂多步任务。',
-  },
-]
-
-const toolCatalog: ToolDefinition[] = [
-  {
-    name: 'BashTool',
-    label: 'BashTool',
-    purpose: '执行 Shell 命令',
-    summary: '跑构建/测试/脚本/后台 dev server',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '执行',
-    riskLabel: '高风险',
-    description: '在本地终端执行 Shell 命令。支持 description（一句话说明用途）、timeout（毫秒，默认 120000，最大 600000）。如果是 dev server、watcher、长构建这类长时间运行的命令，必须把 runInBackground 设为 true —— 会立刻返回 bashId，之后用 BashOutputTool 拉取输出、用 KillShellTool 终止。单次 stdout/stderr 超过 40KB 或 400 行会被自动截断（保留首 80 + 末 320 行），如需完整输出请写到文件再用 FileReadTool 分页读。调用前必须评估 riskLevel：只读查询 low，修改项目文件/安装包 medium，删除、影响系统配置、不可逆操作 high。',
-    parameters: {
-      type: 'object',
-      properties: {
-        command: { type: 'string', description: '要执行的 Shell 命令' },
-        cwd: { type: 'string', description: '命令执行的工作目录，默认当前 workspace' },
-        description: { type: 'string', description: '一句话说明这次命令要做什么（便于回溯/调试）' },
-        timeout: { type: 'number', description: '同步模式的超时（毫秒），默认 120000，最大 600000' },
-        runInBackground: { type: 'boolean', description: '是否后台运行：dev server / watch / 长跑命令必须传 true，返回 bashId' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=只读查询；medium=安装依赖/修改项目文件；high=删除、修改系统配置、不可逆操作',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['command', 'riskLevel', 'riskReason'],
-    },
-    legacyNames: ['execCommand'],
-  },
-  {
-    name: 'BashOutputTool',
-    label: 'BashOutputTool',
-    purpose: '拉取后台 Bash 输出',
-    summary: '读取 runInBackground 的 stdout/stderr',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '读取',
-    riskLabel: '低风险',
-    description: '读取 runInBackground=true 的 BashTool 自上次拉取以来新增的 stdout / stderr，以及当前进程状态（running / completed / exited / killed）。可选用正则 filter 过滤行。后台任务期间应定期轮询直到 status !== running 或得到想要的输出。',
-    parameters: {
-      type: 'object',
-      properties: {
-        bashId: { type: 'string', description: 'BashTool(runInBackground=true) 返回的 bashId' },
-        filter: { type: 'string', description: '可选正则，仅保留匹配此正则的行' },
-      },
-      required: ['bashId'],
-    },
-  },
-  {
-    name: 'KillShellTool',
-    label: 'KillShellTool',
-    purpose: '终止后台 Bash',
-    summary: '杀掉 runInBackground 启动的进程',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '终止',
-    riskLabel: '中风险',
-    description: '终止一个由 BashTool(runInBackground=true) 启动、现在仍在运行的后台进程。先发 SIGTERM，500ms 后仍未退出则 SIGKILL。',
-    parameters: {
-      type: 'object',
-      properties: {
-        bashId: { type: 'string', description: '要终止的后台进程 bashId' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: '一般为 low 或 medium',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['bashId', 'riskLevel', 'riskReason'],
-    },
-  },
-  {
-    name: 'GetWorkspaceRootTool',
-    label: 'GetWorkspaceRootTool',
-    purpose: '查询当前工作目录',
-    summary: '确认后续工具的默认 cwd',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '读取',
-    riskLabel: '低风险',
-    description: '返回本插件进程当前的 cwd。BashTool / GlobTool / GrepTool / FileReadTool 等在未显式传 cwd/path 时会以此为基准。开始工作前可以先调它确认自己站在哪个目录。',
-    parameters: { type: 'object', properties: {} },
-  },
-  {
-    name: 'SetWorkspaceRootTool',
-    label: 'SetWorkspaceRootTool',
-    purpose: '切换默认工作目录',
-    summary: '把进程 cwd 切到目标目录，后续工具按新 cwd 解析相对路径',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '配置',
-    riskLabel: '中风险',
-    description: '修改本插件进程的 cwd。切换后，所有未显式传 cwd/path 的 BashTool / GlobTool / GrepTool / FileRead/Edit/Write/Delete 调用都会以新 cwd 为基准解析相对路径。不会修改用户设置里持久化的 workspaceRoot，下次重启回到用户配置值。切换到系统目录、磁盘根、用户不熟悉的目录时必须 high 风险并说明原因。',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '目标目录的绝对路径' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=用户已知项目目录；medium=首次进入的目录；high=系统目录/磁盘根/不熟悉位置',
-        },
-        riskReason: { type: 'string', description: '一句话说明为什么切到这里' },
-      },
-      required: ['path', 'riskLevel', 'riskReason'],
-    },
-  },
-  {
-    name: 'WebFetchTool',
-    label: 'WebFetchTool',
-    purpose: '抓取并按 prompt 摘要网页',
-    summary: '已知网址时读取页面、可选 LLM 摘要',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '联网',
-    riskLabel: '中风险',
-    description: '抓取指定 URL 的网页正文（自动 HTML→纯文本、截断到 50000 字符）。如果同时提供 prompt，会用当前会话的 LLM 按 prompt 对页面做一次摘要/问答，返回 analysis 字段。禁止访问本地或内网地址。',
-    parameters: {
-      type: 'object',
-      properties: {
-        url: { type: 'string', description: '要抓取的完整网页地址' },
-        prompt: { type: 'string', description: '可选：用自然语言描述你要从这个页面里获得什么，LLM 会据此做摘要/回答' },
-      },
-      required: ['url'],
-    },
-  },
-  {
-    name: 'WebSearchTool',
-    label: 'WebSearchTool',
-    purpose: '联网搜索（Tavily）',
-    summary: '不知道网址时先搜，支持域名过滤',
-    category: 'environment',
-    categoryLabel: '环境与联网工具',
-    capabilityLabel: '联网',
-    riskLabel: '中风险',
-    description: '使用 Tavily 做联网搜索。支持 allowedDomains / blockedDomains 过滤（域名支持 *.example.com 通配）。',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: '搜索关键词或问题' },
-        count: { type: 'number', description: '返回结果数量，默认 5，上限 10' },
-        allowedDomains: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '仅保留命中这些域名的结果（支持 *.example.com）',
-        },
-        blockedDomains: {
-          type: 'array',
-          items: { type: 'string' },
-          description: '过滤掉命中这些域名的结果（支持 *.example.com）',
-        },
-      },
-      required: ['query'],
-    },
-  },
-  {
-    name: 'FileReadTool',
-    label: 'FileReadTool',
-    purpose: '读取文件内容（带行号）',
-    summary: '看代码/配置/文档，支持 offset/limit 分页',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '只读',
-    riskLabel: '低风险',
-    description: '读取本地文件内容。默认返回前 2000 行（cat -n 格式，含行号）。大文件请用 offset/limit 分页读，超长行会被截断为 2000 字符。图片自动转 dataURL；.ipynb 以 cell 边界平铺；PDF 不直接解析（请先用 BashTool 的 pdftotext 转换）。',
-    parameters: {
-      type: 'object',
-      properties: {
-        filePath: { type: 'string', description: '文件绝对路径或相对路径' },
-        offset: { type: 'number', description: '起始行（0-based），默认 0' },
-        limit: { type: 'number', description: '最多返回多少行，默认 2000' },
-      },
-      required: ['filePath'],
-    },
-    legacyNames: ['readFile'],
-  },
-  {
-    name: 'FileEditTool',
-    label: 'FileEditTool',
-    purpose: '按补丁方式编辑文件',
-    summary: '精准替换已有文件中的片段',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '编辑',
-    riskLabel: '中风险',
-    description: '基于查找替换或 edits 补丁列表精确修改文件。建议在修改前先用 FileReadTool 读取最新内容，避免用过时片段替换。old_string/new_string 等价于 oldText/newText 和 search/replace。默认单次替换必须唯一命中，命中多处需显式 replaceAll=true。调用前必须评估 riskLevel：改临时/测试文件 low，改项目源码 medium，改系统配置/关键数据 high。',
-    parameters: {
-      type: 'object',
-      properties: {
-        filePath: { type: 'string', description: '目标文件路径' },
-        old_string: { type: 'string', description: '要替换的原始文本（别名：oldText / search）' },
-        new_string: { type: 'string', description: '替换后的文本（别名：newText / replace）' },
-        replaceAll: { type: 'boolean', description: '是否替换所有匹配，默认 false（多处匹配会报错以防误改）' },
-        edits: {
-          type: 'array',
-          description: '批量补丁：每项含 old_string/new_string（或 oldText/newText / search/replace）与可选 replaceAll',
-          items: {
-            type: 'object',
-            properties: {
-              old_string: { type: 'string' },
-              new_string: { type: 'string' },
-              oldText: { type: 'string' },
-              newText: { type: 'string' },
-              search: { type: 'string' },
-              replace: { type: 'string' },
-              replaceAll: { type: 'boolean' },
-            },
-          },
-        },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=临时/测试文件；medium=项目源码；high=系统配置/关键数据',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['filePath', 'riskLevel', 'riskReason'],
-    },
-  },
-  {
-    name: 'FileWriteTool',
-    label: 'FileWriteTool',
-    purpose: '直接写入整个文件',
-    summary: '新建文件或整体重写',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '写入',
-    riskLabel: '高风险',
-    description: '将完整文本写入目标文件。若文件已存在，建议先 FileReadTool 读一遍当前内容，或者改用 FileEditTool 做局部替换（更安全、diff 更清晰）。调用前必须评估 riskLevel：新建临时文件 low，整体重写项目源码 medium，覆盖系统配置/破坏数据 high。',
-    parameters: {
-      type: 'object',
-      properties: {
-        filePath: { type: 'string', description: '目标文件路径' },
-        content: { type: 'string', description: '要写入的完整文件内容' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=新建临时文件；medium=整体重写项目源码；high=覆盖配置/破坏数据',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['filePath', 'content', 'riskLevel', 'riskReason'],
-    },
-    legacyNames: ['writeFile'],
-  },
-  {
-    name: 'FileDeleteTool',
-    label: 'FileDeleteTool',
-    purpose: '删除文件或目录',
-    summary: '删除前自动快照，可通过消息回滚恢复',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '删除',
-    riskLabel: '高风险',
-    description: '删除指定的文件或目录（目录需 recursive=true）。本工具会在删除前自动保存快照，用户可通过"回滚到此处"恢复。**删文件/目录务必使用本工具，不要用 BashTool 的 rm / rmdir / del / Remove-Item 等命令**，否则无法回滚。',
-    parameters: {
-      type: 'object',
-      properties: {
-        filePath: { type: 'string', description: '要删除的文件或目录的绝对路径' },
-        recursive: { type: 'boolean', description: '目标是目录时必须传 true 才能删除，默认 false' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=临时产物；medium=项目文件；high=系统配置/不可逆数据',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['filePath', 'riskLevel', 'riskReason'],
-    },
-  },
-  {
-    name: 'NotebookEditTool',
-    label: 'NotebookEditTool',
-    purpose: '编辑 Jupyter Notebook cell',
-    summary: '替换 / 插入 / 删除 .ipynb 单元格',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '编辑',
-    riskLabel: '中风险',
-    description: '对 .ipynb notebook 的单元格进行原子级修改：editMode=replace（替换单元格源码和/或类型）、insert（在指定 cellId 之后插入新 cell，无 cellId 时插到开头）、delete（删除单元格）。替换/插入时必须传 newSource；插入必须指定 cellType（code | markdown）。修改前会自动快照以支持回滚。',
-    parameters: {
-      type: 'object',
-      properties: {
-        notebookPath: { type: 'string', description: '.ipynb 文件的绝对路径' },
-        cellId: { type: 'string', description: '要操作的 cell 的 id（或十进制索引字符串）；insert 可省略以插到开头' },
-        cellType: { type: 'string', enum: ['code', 'markdown'], description: 'insert 必填；replace 时可用于同时改类型' },
-        editMode: { type: 'string', enum: ['replace', 'insert', 'delete'], description: '编辑模式，默认 replace' },
-        newSource: { type: 'string', description: 'replace / insert 时写入的 cell 源码（markdown 也是字符串）' },
-        riskLevel: {
-          type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'low=临时 notebook；medium=项目 notebook；high=关键实验',
-        },
-        riskReason: { type: 'string', description: '风险评估的简短说明（一句话）' },
-      },
-      required: ['notebookPath', 'riskLevel', 'riskReason'],
-    },
-  },
-  {
-    name: 'GlobTool',
-    label: 'GlobTool',
-    purpose: '按路径模式查找文件',
-    summary: '结果按最近修改时间降序',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '检索',
-    riskLabel: '低风险',
-    description: '按 glob 模式查找文件或目录，返回按 mtime 降序排序的列表（最新改动的排最上）。用来快速定位"最近改过的相关文件"。',
-    parameters: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: 'glob 路径模式，如 **/*.ts、src/**/*.vue' },
-        path: { type: 'string', description: '搜索起始目录，可选' },
-        includeDirectories: { type: 'boolean', description: '是否同时返回目录，默认 false' },
-        limit: { type: 'number', description: '最多返回多少条，默认 200' },
-      },
-      required: ['pattern'],
-    },
-    legacyNames: ['readDir'],
-  },
-  {
-    name: 'GrepTool',
-    label: 'GrepTool',
-    purpose: '在代码中搜索内容',
-    summary: '支持三种输出模式、上下文、类型过滤、multiline',
-    category: 'file',
-    categoryLabel: '文件工具',
-    capabilityLabel: '检索',
-    riskLabel: '低风险',
-    description: '在目录或单个文件中按正则搜索。三种 outputMode：files_with_matches（默认，只返回命中的文件路径，最省 token，适合先定位）、content（返回匹配行 + 可选上下文，适合要看现场）、count（每文件匹配次数，估量级）。支持 type（js/ts/py/vue/go 等快捷分类）、glob（文件名过滤）、multiline（跨行匹配，用 [\\s\\S] 语义）、beforeContext/afterContext/context、caseSensitive、headLimit+offset 分页。pattern 默认按正则处理（isRegex=true）。',
-    parameters: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: '正则或字面量字符串' },
-        path: { type: 'string', description: '搜索起点目录或单个文件，可选' },
-        glob: { type: 'string', description: '文件名 glob 过滤，如 *.ts、src/**/*.vue' },
-        type: { type: 'string', description: '按文件类型过滤：js / ts / py / vue / go / rust / md / json / yaml 等，可用逗号分隔多个' },
-        outputMode: {
-          type: 'string',
-          enum: ['files_with_matches', 'content', 'count'],
-          description: '默认 files_with_matches',
-        },
-        isRegex: { type: 'boolean', description: '是否把 pattern 当正则处理，默认 true' },
-        caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
-        multiline: { type: 'boolean', description: '跨行匹配（. 匹配换行），默认 false' },
-        beforeContext: { type: 'number', description: 'content 模式下每个匹配前附带几行上下文' },
-        afterContext: { type: 'number', description: 'content 模式下每个匹配后附带几行上下文' },
-        context: { type: 'number', description: 'beforeContext 和 afterContext 的统一简写' },
-        showLineNumbers: { type: 'boolean', description: 'content 模式是否显示行号，默认 true' },
-        headLimit: { type: 'number', description: '最多返回多少条结果，默认 250' },
-        offset: { type: 'number', description: '从第几条开始返回（分页），默认 0' },
-      },
-      required: ['pattern'],
-    },
-  },
-  {
-    name: 'TodoWriteTool',
-    label: 'TodoWriteTool',
-    purpose: '维护当前会话的任务计划',
-    summary: '拆分复杂任务、实时更新进度',
-    category: 'task',
-    categoryLabel: '任务与计划',
-    capabilityLabel: '规划',
-    riskLabel: '低风险',
-    description: '把当前任务拆成步骤清单并维护进度。每次调用会完整替换当前会话的 todos。每一项包含：content（祈使句，例如"修复登录校验 bug"）、activeForm（进行时，例如"修复登录校验 bug 中"）、status（pending / in_progress / completed）。同一时间只允许一个 in_progress。复杂多步任务（≥3 步）开工前就要先列 todo；每完成一步立即调用本工具把对应项从 in_progress 切到 completed，并把下一步切到 in_progress。',
-    parameters: {
-      type: 'object',
-      properties: {
-        todos: {
-          type: 'array',
-          description: '完整的任务列表（替换式）',
-          items: {
-            type: 'object',
-            properties: {
-              content: { type: 'string', description: '任务内容（祈使句）' },
-              activeForm: { type: 'string', description: '任务进行时描述' },
-              status: {
-                type: 'string',
-                enum: ['pending', 'in_progress', 'completed'],
-                description: '任务状态',
-              },
-            },
-            required: ['content', 'activeForm', 'status'],
-          },
-        },
-      },
-      required: ['todos'],
-    },
-  },
-]
-
-const toolCatalogMap = new Map<string, ToolDefinition>()
-toolCatalog.forEach((tool) => {
-  toolCatalogMap.set(tool.name, tool)
-  ;(tool.legacyNames ?? []).forEach((legacyName) => {
-    toolCatalogMap.set(legacyName, tool)
-  })
-})
-
-const getDefaultEnabledToolNames = () => toolCatalog.map((tool) => tool.name)
-
-const normalizeEnabledToolNames = (value: unknown) => {
-  const availableToolNames = new Set(toolCatalog.map((tool) => tool.name))
-  if (!Array.isArray(value)) {
-    return getDefaultEnabledToolNames()
-  }
-
-  const normalized = Array.from(
-    new Set(
-      value
-        .map((item) => String(item))
-        .map((name) => toolCatalogMap.get(name)?.name ?? '')
-        .filter((name) => availableToolNames.has(name)),
-    ),
-  )
-
-  return normalized.length ? normalized : getDefaultEnabledToolNames()
-}
-
-const MAX_TOOL_CALL_ROUNDS_SAFETY_CAP = 24
-const DEFAULT_MAX_TOOL_CALL_ROUNDS = 6
-
-const defaultAppSettings: AppSettings = {
-  enableToolRoundLimit: false,
-  maxToolCallRounds: DEFAULT_MAX_TOOL_CALL_ROUNDS,
-  composerSendMode: 'enter',
-  autoExpandToolDetails: false,
-  autoRefreshDebugLogs: true,
-  enableStreamResponse: true,
-  autoScrollWhileStreaming: true,
-  enableLocalTools: true,
-  enabledToolNames: getDefaultEnabledToolNames(),
-  tavilyApiKey: '',
-  stopWhenToolError: false,
-  safetyMode: 'moderate',
-  moderateOnlyHigh: false,
-  toolListKind: 'black',
-  toolListNames: [],
-  commandListKind: 'black',
-  commandListPatterns: [],
-  workspaceRoot: '',
-  launchAutoSend: false,
-}
-
-const createMessageId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
-
-const createBlockId = () => `block_${createMessageId()}`
-
-const clampToolRoundLimit = (value: unknown) => {
-  const parsedValue = Number(value)
-  if (!Number.isFinite(parsedValue)) {
-    return DEFAULT_MAX_TOOL_CALL_ROUNDS
-  }
-  return Math.min(MAX_TOOL_CALL_ROUNDS_SAFETY_CAP, Math.max(1, Math.round(parsedValue)))
-}
-
-const normalizeComposerSendMode = (value: unknown): ComposerSendMode =>
-  value === 'ctrlEnter' ? 'ctrlEnter' : 'enter'
-
-const cloneAppSettings = (settings: AppSettings): AppSettings => ({
-  ...settings,
-})
-
-const normalizeSafetyMode = (value: unknown): SafetyMode => {
-  if (value === 'strict' || value === 'loose' || value === 'moderate' || value === 'allowlist') return value
-  return 'moderate'
-}
-
-const normalizeAllowListKind = (value: unknown): AllowListKind =>
-  value === 'white' ? 'white' : 'black'
-
-const normalizeStringArray = (value: unknown, limit = 500): string[] => {
-  if (!Array.isArray(value)) return []
-  const result: string[] = []
-  const seen = new Set<string>()
-  for (const item of value) {
-    if (typeof item !== 'string') continue
-    const trimmed = item.trim()
-    if (!trimmed || seen.has(trimmed)) continue
-    seen.add(trimmed)
-    result.push(trimmed)
-    if (result.length >= limit) break
-  }
-  return result
-}
-
-const normalizeAppSettings = (value: unknown): AppSettings => {
-  const current = typeof value === 'object' && value !== null ? value as Partial<AppSettings> : {}
-
-  return {
-    enableToolRoundLimit: Boolean(current.enableToolRoundLimit),
-    maxToolCallRounds: clampToolRoundLimit(current.maxToolCallRounds),
-    composerSendMode: normalizeComposerSendMode(current.composerSendMode),
-    autoExpandToolDetails: current.autoExpandToolDetails === true,
-    autoRefreshDebugLogs: current.autoRefreshDebugLogs !== false,
-    enableStreamResponse: current.enableStreamResponse !== false,
-    autoScrollWhileStreaming: current.autoScrollWhileStreaming !== false,
-    enableLocalTools: current.enableLocalTools !== false,
-    enabledToolNames: normalizeEnabledToolNames(current.enabledToolNames),
-    tavilyApiKey: String(current.tavilyApiKey ?? ''),
-    stopWhenToolError: Boolean(current.stopWhenToolError),
-    safetyMode: normalizeSafetyMode(current.safetyMode),
-    moderateOnlyHigh: Boolean(current.moderateOnlyHigh),
-    toolListKind: normalizeAllowListKind(current.toolListKind),
-    toolListNames: normalizeStringArray(current.toolListNames, 64),
-    commandListKind: normalizeAllowListKind(current.commandListKind),
-    commandListPatterns: normalizeStringArray(current.commandListPatterns, 256),
-    workspaceRoot: String(current.workspaceRoot ?? '').trim(),
-    launchAutoSend: current.launchAutoSend === true,
-  }
-}
-
-const normalizeToolDiff = (value: unknown): ToolDiff | null => {
-  if (!value || typeof value !== 'object') return null
-  const raw = value as Partial<ToolDiff>
-  if (typeof raw.diffText !== 'string') return null
-  const added = Number(raw.addedLines)
-  const removed = Number(raw.removedLines)
-  if (!Number.isFinite(added) || !Number.isFinite(removed)) return null
-  return {
-    filePath: typeof raw.filePath === 'string' ? raw.filePath : undefined,
-    addedLines: Math.max(0, Math.floor(added)),
-    removedLines: Math.max(0, Math.floor(removed)),
-    diffText: raw.diffText,
-    tooLarge: Boolean(raw.tooLarge),
-    diffTruncated: Boolean(raw.diffTruncated),
-  }
-}
-
-const normalizeChangeSummary = (value: unknown): ChangeSummary | null => {
-  if (!value || typeof value !== 'object') return null
-  const raw = value as Partial<ChangeSummary>
-  const files = Array.isArray(raw.files)
-    ? raw.files
-        .filter(Boolean)
-        .map((file) => {
-          const entry = file as Partial<ChangeSummaryFile>
-          const path = String(entry?.path ?? '').trim()
-          if (!path) return null
-          return {
-            path,
-            added: Math.max(0, Math.floor(Number(entry?.added) || 0)),
-            removed: Math.max(0, Math.floor(Number(entry?.removed) || 0)),
-            kind: String(entry?.kind ?? ''),
-          } satisfies ChangeSummaryFile
-        })
-        .filter((item): item is ChangeSummaryFile => item !== null)
-    : []
-  if (!files.length) return null
-  const addedLines = files.reduce((sum, file) => sum + file.added, 0)
-  const removedLines = files.reduce((sum, file) => sum + file.removed, 0)
-  return { files, addedLines, removedLines }
-}
-
-const normalizeToolInvocation = (value: unknown, index: number): ToolInvocation => {
-  const current = value as Partial<ToolInvocation>
-  const normalizedStatus = String(current.status ?? 'pending')
-  const allowedStatus: ToolInvocationStatus[] = ['draft', 'pending', 'running', 'success', 'error']
-
-  return {
-    id: String(current.id ?? `tool_${index}`),
-    callId: String(current.callId ?? current.id ?? `tool_${index}`),
-    name: String(current.name ?? ''),
-    argumentsText: String(current.argumentsText ?? ''),
-    resultText: String(current.resultText ?? ''),
-    status: allowedStatus.includes(normalizedStatus as ToolInvocationStatus)
-      ? (normalizedStatus as ToolInvocationStatus)
-      : 'pending',
-    expanded: Boolean(current.expanded),
-    diff: normalizeToolDiff(current.diff),
-  }
-}
-
-const normalizeToolInvocations = (value: unknown): ToolInvocation[] => {
-  if (!Array.isArray(value)) {
-    return []
-  }
-
-  return value
-    .filter(Boolean)
-    .map((tool, index) => normalizeToolInvocation(tool, index))
-}
-
-const cloneToolInvocation = (toolInvocation: ToolInvocation): ToolInvocation => ({
-  ...toolInvocation,
-})
-
-const cloneMessageBlocks = (blocks: AssistantMessageBlock[]) =>
-  blocks.map((block) => (
-    block.type === 'text'
-      ? { ...block }
-      : {
-          ...block,
-          toolInvocation: cloneToolInvocation(block.toolInvocation),
-        }
-  ))
-
-const buildAssistantContentFromBlocks = (blocks: AssistantMessageBlock[]) =>
-  blocks
-    .filter((block): block is TextMessageBlock => block.type === 'text')
-    .map((block) => block.content)
-    .filter(Boolean)
-    .join('\n\n')
-
-const buildToolInvocationsFromBlocks = (blocks: AssistantMessageBlock[]) =>
-  blocks
-    .filter((block): block is ToolMessageBlock => block.type === 'tool')
-    .map((block) => cloneToolInvocation(block.toolInvocation))
-
-const normalizeMessageBlocks = (
-  value: unknown,
-  fallbackContent = '',
-  fallbackToolInvocations: ToolInvocation[] = [],
-): AssistantMessageBlock[] => {
-  if (Array.isArray(value)) {
-    return value
-      .filter(Boolean)
-      .map((block, index) => {
-        const current = block as Record<string, unknown>
-        const type = current.type === 'tool' ? 'tool' : 'text'
-
-        if (type === 'tool') {
-          return {
-            id: String(current.id ?? createBlockId()),
-            type: 'tool' as const,
-            toolInvocation: normalizeToolInvocation(
-              current.toolInvocation ?? current.tool ?? current,
-              index,
-            ),
-          }
-        }
-
-        return {
-          id: String(current.id ?? createBlockId()),
-          type: 'text' as const,
-          content: String(current.content ?? ''),
-        }
-      })
-  }
-
-  const fallbackBlocks: AssistantMessageBlock[] = []
-  if (fallbackContent) {
-    fallbackBlocks.push({
-      id: createBlockId(),
-      type: 'text',
-      content: fallbackContent,
-    })
-  }
-
-  fallbackToolInvocations.forEach((toolInvocation) => {
-    fallbackBlocks.push({
-      id: createBlockId(),
-      type: 'tool',
-      toolInvocation: cloneToolInvocation(toolInvocation),
-    })
-  })
-
-  return fallbackBlocks
-}
-
-const syncAssistantMessageState = (message: ChatMessage): ChatMessage => {
-  if (message.role !== 'assistant') {
-    return {
-      ...message,
-      blocks: [],
-    }
-  }
-
-  const nextBlocks = cloneMessageBlocks(message.blocks ?? [])
-  return {
-    ...message,
-    blocks: nextBlocks,
-    content: buildAssistantContentFromBlocks(nextBlocks),
-    toolInvocations: buildToolInvocationsFromBlocks(nextBlocks),
-  }
-}
-
-const normalizeAttachment = (value: unknown, index: number): Attachment | null => {
-  if (!value || typeof value !== 'object') {
-    return null
-  }
-  const current = value as Partial<Attachment>
-  const kind = current.kind === 'image' || current.kind === 'folder' ? current.kind : 'file'
-  const path = String(current.path ?? '').trim()
-  const name = String(current.name ?? '').trim()
-  if (!path && !name) {
-    return null
-  }
-  return {
-    id: String(current.id ?? `att_${Date.now()}_${index}`),
-    kind,
-    name: name || path.split(/[\\/]/).pop() || '附件',
-    path,
-    size: typeof current.size === 'number' ? current.size : undefined,
-    mimeType: typeof current.mimeType === 'string' ? current.mimeType : undefined,
-  }
-}
-
-const normalizeAttachments = (value: unknown): Attachment[] => {
-  if (!Array.isArray(value)) {
-    return []
-  }
-  return value
-    .map((item, index) => normalizeAttachment(item, index))
-    .filter((item): item is Attachment => item !== null)
-}
-
-const serializeAttachmentForStorage = (attachment: Attachment): Attachment => ({
-  id: attachment.id,
-  kind: attachment.kind,
-  name: attachment.name,
-  path: attachment.path,
-  size: attachment.size,
-  mimeType: attachment.mimeType,
-})
-
-const cloneAttachments = (list: Attachment[] | undefined): Attachment[] =>
-  Array.isArray(list) ? list.map((item) => ({ ...item })) : []
-
-const createMessage = (
-  role: MessageRole,
-  content: string,
-  options: Partial<Omit<ChatMessage, 'id' | 'role' | 'content' | 'createdAt'>> = {},
-): ChatMessage => ({
-  id: createMessageId(),
-  role,
-  content,
-  createdAt: Date.now(),
-  isStreaming: false,
-  toolInvocations: [],
-  blocks: role === 'assistant'
-    ? (content
-      ? [{ id: createBlockId(), type: 'text', content }]
-      : [])
-    : [],
-  attachments: [],
-  hasSnapshot: false,
-  ...options,
-})
-
-const normalizeMessages = (value: unknown): ChatMessage[] => {
-  if (!Array.isArray(value)) {
-    return []
-  }
-
-  return value
-    .filter(Boolean)
-    .map((message, index) => {
-      const current = message as Partial<ChatMessage>
-      const role = (current.role ?? 'system') as MessageRole
-      const normalizedToolInvocations = normalizeToolInvocations(current.toolInvocations)
-      const normalizedAttachments = normalizeAttachments(
-        (current as Partial<ChatMessage> & { attachments?: unknown }).attachments,
-      )
-      const normalizedMessage: ChatMessage = {
-        id: String(current.id ?? `message_${Date.now()}_${index}`),
-        role,
-        content: String(current.content ?? ''),
-        createdAt: Number(current.createdAt ?? Date.now() + index),
-        isStreaming: false,
-        toolInvocations: normalizedToolInvocations,
-        blocks: role === 'assistant'
-          ? normalizeMessageBlocks(
-              (current as Partial<ChatMessage> & { blocks?: unknown }).blocks,
-              String(current.content ?? ''),
-              normalizedToolInvocations,
-            )
-          : [],
-        attachments: normalizedAttachments,
-        hasSnapshot: Boolean((current as Partial<ChatMessage>).hasSnapshot),
-        changeSummary: normalizeChangeSummary((current as Partial<ChatMessage>).changeSummary),
-      }
-
-      return role === 'assistant' ? syncAssistantMessageState(normalizedMessage) : normalizedMessage
-    })
-}
-
-const createDefaultProviders = (): Provider[] => [
-  {
-    id: 'openai',
-    name: 'OpenAI',
-    baseURL: 'https://api.openai.com/v1',
-    apiKey: '',
-    models: ['gpt-3.5-turbo', 'gpt-4o', 'gpt-4-turbo'],
-  },
-  {
-    id: 'deepseek',
-    name: 'DeepSeek',
-    baseURL: 'https://api.deepseek.com/v1',
-    apiKey: '',
-    models: ['deepseek-chat', 'deepseek-coder'],
-  },
-]
-
-const defaultSystemPrompt = `你是 Kuke 本地 AI Agent，可以在用户的机器上按需调用工具来完成任务。
-
-【当前环境】
-- 当前时间：{{currentTime}}（{{timezone}}）
-- 操作系统：{{osType}} {{osRelease}} · {{platform}}/{{arch}}
-- 工作目录：{{cwd}}
-- 当前用户：{{user}}@{{hostname}}
-- Node 版本：{{nodeVersion}}
-
-【可用工具】
-- 文件：FileReadTool（支持 offset/limit 分页；图片/ipynb 自动识别）、FileEditTool（精确替换；修改前先 FileReadTool 读最新内容）、FileWriteTool（整文件重写；已有文件建议改用 FileEditTool）、FileDeleteTool（带快照回滚）、NotebookEditTool（Jupyter cell 级编辑）
-- 检索：GlobTool（按 mtime 倒序找文件）、GrepTool（三种 outputMode：files_with_matches/content/count；支持 type 过滤、multiline、上下文）
-- 终端：BashTool（同步执行；长任务务必 runInBackground=true）、BashOutputTool（拉取后台 stdout/stderr）、KillShellTool（终止后台进程）
-- 网络：WebFetchTool（含可选 prompt 摘要）、WebSearchTool（支持域名白/黑名单）
-- 规划：TodoWriteTool（拆步骤、实时更新进度）
-
-【工作原则】
-1. 开工前先 GetWorkspaceRootTool 确认当前 cwd；如果不是期望的项目目录，立即用 SetWorkspaceRootTool 切过去，避免在系统目录里瞎跑 ls/dir 把上下文打爆。
-2. 复杂多步任务（≥3 步）开工前先用 TodoWriteTool 列任务清单；每完成一步立即更新对应项状态，保持同一时间只有一个 in_progress。
-3. 先 GlobTool/GrepTool 定位 → 再 FileReadTool 读精确内容 → 再 FileEditTool 做最小改动。搜代码优先用 GrepTool 的 files_with_matches 省 token，要看现场再切 content + context。
-4. 读大文件时用 FileReadTool 的 offset/limit 分页，不要盲目读整份。BashTool 产生的大输出会自动截断，如需完整内容请重定向到文件再 FileReadTool 分页。
-5. 文件操作一律优先用专用工具，系统会自动快照支持回滚；**不要用 BashTool 的 rm / del / Remove-Item / mv / cp / sed -i / echo > 等命令替代**。
-6. 跑 dev server / watch / 长构建/ 长脚本时必须 BashTool 加 runInBackground=true，之后用 BashOutputTool 轮询输出，任务结束或不再需要时用 KillShellTool 关闭。
-7. 需要联网时：已知 URL → WebFetchTool；如果要针对性问题就再带上 prompt；未知 URL → WebSearchTool，可用 allowedDomains / blockedDomains 聚焦信源。
-8. 每次调用 BashTool / FileEditTool / FileWriteTool / FileDeleteTool / NotebookEditTool / KillShellTool / SetWorkspaceRootTool 都必须如实评估 riskLevel（low=临时/只读；medium=项目文件；high=删除、系统配置、不可逆操作）并在 riskReason 写一句解释。
-9. 执行写入、删除、命令等有副作用的操作前，先简要说明目标、影响范围；回复保持简洁、结构化、可执行。`
-
-const systemPromptPresets = [
-  {
-    id: 'general',
-    label: '通用 Agent',
-    prompt: defaultSystemPrompt,
-  },
-  {
-    id: 'coding',
-    label: '代码协作',
-    prompt: `你是 Kuke 本地开发协作助手。当前时间 {{currentTime}}，工作目录 {{cwd}}（{{osType}} {{arch}}）。
-
-工作流：复杂任务先 TodoWriteTool 列步骤 → GlobTool/GrepTool 定位相关文件（GrepTool 优先 files_with_matches，要看现场再切 content+context）→ FileReadTool 读精确内容（大文件用 offset/limit 分页）→ FileEditTool 做最小局部修改 → 需要跑 dev server/测试/构建时用 BashTool（长任务 runInBackground=true + BashOutputTool 轮询）。每完成一步立刻 TodoWriteTool 更新状态。输出保持结构清晰、可执行，说明改动范围与影响。`,
-  },
-  {
-    id: 'automation',
-    label: '系统执行',
-    prompt: `你是 Kuke 本地自动化执行助手。当前时间 {{currentTime}}，系统 {{osType}} {{osRelease}}，工作目录 {{cwd}}。
-
-调用文件与命令工具前先确认目标与风险，并在 riskLevel/riskReason 如实填写。长任务（dev server、watcher、构建）用 BashTool 的 runInBackground=true，再用 BashOutputTool 轮询；不再需要时 KillShellTool 关闭。删文件用 FileDeleteTool（带快照回滚），不要用 rm/del/Remove-Item。回复聚焦执行结果、副作用与回滚方式。`,
-  },
-]
-
-const loadProviders = (): Provider[] => {
-  const stored = localStorage.getItem('kuke_providers')
-  if (!stored) {
-    return createDefaultProviders()
-  }
-
-  try {
-    const parsed = JSON.parse(stored)
-    return Array.isArray(parsed) && parsed.length ? parsed : createDefaultProviders()
-  } catch {
-    return createDefaultProviders()
-  }
-}
-
-const loadAppSettings = (): AppSettings => {
-  const stored = localStorage.getItem('kuke_settings')
-  if (!stored) {
-    return cloneAppSettings(defaultAppSettings)
-  }
-
-  try {
-    return normalizeAppSettings(JSON.parse(stored))
-  } catch {
-    return cloneAppSettings(defaultAppSettings)
-  }
-}
 
 const messages = ref<ChatMessage[]>([])
 const input = ref('')
@@ -1164,6 +101,7 @@ const activeSettingsTab = ref('tools')
 const isSidebarOpen = ref(true)
 const isTodoDrawerOpen = ref(false)
 const isBashShellsOpen = ref(false)
+const sidebarSearch = ref('')
 const activeBashShells = ref<Array<{
   bashId: string
   status: string
@@ -1194,6 +132,11 @@ const systemPromptDraft = ref(systemPrompt.value)
 const appSettings = ref<AppSettings>(loadAppSettings())
 const appSettingsDraft = ref<AppSettings>(cloneAppSettings(appSettings.value))
 const sessions = ref<ChatSession[]>([])
+const filteredSessions = computed(() => {
+  const query = sidebarSearch.value.trim().toLowerCase()
+  if (!query) return sessions.value
+  return sessions.value.filter(s => s.title.toLowerCase().includes(query))
+})
 const currentSessionId = ref('')
 const sessionRuntimeState = ref<Record<string, SessionRuntimeState>>({})
 const debugLogs = ref<DebugLogEntry[]>([])
@@ -2234,30 +1177,7 @@ const getToolResultPlaceholder = (tool: ToolInvocation) =>
     error: '工具执行失败，但当前没有错误详情。',
   })[tool.status]
 
-const tryParseJson = (value: string) => {
-  try {
-    return JSON.parse(value)
-  } catch {
-    return null
-  }
-}
 
-const hasOwnKey = (target: Record<string, unknown>, key: string) =>
-  Object.prototype.hasOwnProperty.call(target, key)
-
-const getArgumentByAliases = (parsedArguments: Record<string, unknown>, aliases: string[]) => {
-  for (const alias of aliases) {
-    if (hasOwnKey(parsedArguments, alias)) {
-      const value = parsedArguments[alias]
-      if (value !== undefined && value !== null) {
-        return value
-      }
-    }
-  }
-  return undefined
-}
-
-const stringifyArgument = (value: unknown) => (value === undefined ? '' : String(value))
 
 const cloneMessages = (messageList: ChatMessage[]) =>
   messageList.map((message) => ({
@@ -2437,26 +1357,6 @@ const handleComposerKeydown = (event: KeyboardEvent) => {
   void sendMessage()
 }
 
-const FILE_MUTATING_TOOLS = new Set(['FileEditTool', 'FileWriteTool', 'FileDeleteTool', 'writeFile', 'NotebookEditTool'])
-const MUTATING_TOOL_NAMES = new Set(['BashTool', 'execCommand', 'FileEditTool', 'FileWriteTool', 'FileDeleteTool', 'writeFile', 'NotebookEditTool', 'KillShellTool', 'SetWorkspaceRootTool'])
-
-type ToolConfirmationDecision = 'allow_once' | 'allow_always' | 'allow_and_remember' | 'deny'
-
-interface PendingToolConfirmation {
-  id: string
-  toolName: string
-  toolLabel: string
-  toolPurpose: string
-  args: Record<string, unknown>
-  argsPreview: string
-  riskLevel: ToolRiskLevel
-  riskReason: string
-  sessionId: string
-  allowlistAction?: 'add_to_white' | 'remove_from_black'
-  bashCommand?: string
-  resolve: (decision: ToolConfirmationDecision) => void
-}
-
 const pendingConfirmation = ref<PendingToolConfirmation | null>(null)
 const sessionAlwaysAllow = ref<Record<string, Set<string>>>({})
 
@@ -2475,15 +1375,6 @@ const getCanonicalToolName = (toolName: string) => {
   if (toolName === 'readDir') return 'GlobTool'
   return toolName
 }
-
-type ToolGateDecision =
-  | { kind: 'allow' }
-  | { kind: 'deny'; reason: string }
-  | {
-      kind: 'confirm'
-      allowlistAction?: 'add_to_white' | 'remove_from_black'
-      bashCommand?: string
-    }
 
 const escapeRegExpForGlob = (value: string) => value.replace(/[.+?^${}()|[\]\\]/g, '\\$&')
 
@@ -2671,7 +1562,6 @@ const executeLocalTool = async (
   availableTool: any,
   context: { sessionId: string; messageId: string } | null = null,
 ) => {
-  console.log('[KukeAgent][DEBUG] executeLocalTool 被调用:', functionName, '参数:', JSON.stringify(parsedArguments))
   if (typeof availableTool !== 'function') {
     return {
       success: false,
@@ -2892,7 +1782,6 @@ const executeLocalTool = async (
     }
     case 'FileEditTool':
     default: {
-      console.log('[KukeAgent][DEBUG] default case 工具调用:', functionName, '参数:', JSON.stringify(parsedArguments))
       const enrichedArgs = context
         ? { ...parsedArguments, __context: context }
         : parsedArguments
@@ -3022,24 +1911,7 @@ const getRollbackButtonTitle = (message: ChatMessage) =>
     : '撤回此消息及其之后的对话，并放回输入框'
 
 
-const stringifyForBlock = (value: unknown) => {
-  if (typeof value === 'string') {
-    const parsed = tryParseJson(value)
-    if (parsed !== null) {
-      return JSON.stringify(parsed, null, 2)
-    }
-    return value
-  }
 
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return String(value ?? '')
-  }
-}
-
-const isToolResultError = (value: unknown) =>
-  typeof value === 'object' && value !== null && 'success' in value && (value as { success?: boolean }).success === false
 
 const getMessageRoleLabel = (role: MessageRole) =>
   ({
@@ -3394,6 +2266,7 @@ const addNewProvider = () => {
   providers.value.push({
     id: newId,
     name: '新供应商',
+    type: 'openai',
     baseURL: 'https://',
     apiKey: '',
     models: ['default-model'],
@@ -3483,14 +2356,20 @@ const fetchModels = async () => {
     const response = await modelFetcher({
       apiKey: currentProvider.value.apiKey,
       baseURL: currentProvider.value.baseURL,
+      providerType: currentProvider.value.type,
     })
 
     if (!response.success || !response.data) {
-      throw new Error(response.error || '未返回模型数据')
+      if (response.error) {
+        throw new Error(response.error)
+      }
+      return
     }
 
     const fetchedModels = response.data.map((model: { id: string }) => model.id)
-    currentProvider.value.models = Array.from(new Set([...currentProvider.value.models, ...fetchedModels])).sort()
+    if (fetchedModels.length > 0) {
+      currentProvider.value.models = Array.from(new Set([...currentProvider.value.models, ...fetchedModels])).sort()
+    }
 
     if (!currentProvider.value.models.includes(selectedModel.value)) {
       selectedModel.value = currentProvider.value.models[0] || ''
@@ -3707,6 +2586,7 @@ const sendMessage = async () => {
       apiKey: currentProvider.value.apiKey,
       baseURL: currentProvider.value.baseURL,
       model: selectedModel.value,
+      providerType: currentProvider.value.type,
     }
     const enabledToolsForRequest = appSettings.value.enableLocalTools ? enabledTools.value : []
     const configuredToolRoundLimit = appSettings.value.enableToolRoundLimit
@@ -3786,14 +2666,10 @@ const sendMessage = async () => {
         if (!isRequestStillActive(sessionId, requestId) || runtime.stopRequested) {
           break
         }
-        console.log('[KukeAgent][DEBUG] ToolCall 原始结构:', JSON.stringify(toolCall, null, 2))
         const functionName = toolCall.function?.name ?? toolCall.name ?? (toolCall as any).function_name
         const rawArguments = toolCall.function?.arguments ?? toolCall.arguments ?? (toolCall as any).arguments_json ?? '{}'
-        console.log('[KukeAgent][DEBUG] 解析后 functionName:', functionName, '| rawArguments:', rawArguments, '| toolCall.id:', toolCall.id, '| toolCall.type:', toolCall.type)
         const availableTool = (window as any).localTools?.[functionName]
-        console.log('[KukeAgent][DEBUG] availableTool 查找结果:', availableTool ? 'found: ' + functionName : 'NOT FOUND for: ' + functionName, '| localTools keys:', Object.keys((window as any).localTools ?? {}).join(', '))
         const parsedArguments = tryParseJson(rawArguments)
-        console.log('[KukeAgent][DEBUG] parsedArguments 结果:', parsedArguments === null ? 'PARSE_FAILED' : 'OK', '| typeof:', typeof parsedArguments)
         const toolCallId = String(toolCall.id ?? `tool_${currentRound}_${toolIndex}`)
         appendToolInvocation(sessionId, assistantMessageId, {
           id: toolCallId,
@@ -3821,14 +2697,12 @@ const sendMessage = async () => {
         let toolResult: unknown = null
 
         if (parsedArguments === null || typeof parsedArguments !== 'object') {
-          console.error('[KukeAgent][DEBUG] 参数解析失败:', { rawArguments, parsedArguments })
           toolResult = {
             success: false,
             error: '工具参数解析失败',
             rawArguments,
           }
         } else if (typeof availableTool === 'function') {
-          console.log('[KukeAgent][DEBUG] 开始执行工具:', functionName, '参数:', JSON.stringify(parsedArguments))
           toolResult = await runToolWithCancel(
             sessionId,
             Promise.resolve().then(() =>
@@ -3840,9 +2714,7 @@ const sendMessage = async () => {
               ),
             ),
           )
-          console.log('[KukeAgent][DEBUG] 工具执行完成:', functionName, '结果:', JSON.stringify(toolResult).slice(0, 500))
         } else {
-          console.error('[KukeAgent][DEBUG] 工具不存在:', functionName, 'availableTool:', availableTool)
           toolResult = {
             success: false,
             error: '当前环境未提供此本地工具。',
@@ -4066,7 +2938,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-root relative flex h-screen w-screen overflow-hidden bg-white text-zinc-900 font-sans">
+  <div :class="['app-root relative flex h-screen w-screen overflow-hidden bg-[var(--app-bg)] text-[var(--text)] font-sans', { dark: isDark }]">
     <Transition name="overlay-fade">
       <div
         v-if="isSidebarOpen"
@@ -4078,7 +2950,7 @@ onBeforeUnmount(() => {
     <!-- Sidebar -->
     <aside
       :class="[
-        'sidebar-drawer absolute inset-y-0 left-0 z-30 flex w-[260px] flex-col border-r border-zinc-200 bg-zinc-50/75 md:static md:z-auto',
+        'sidebar-drawer absolute inset-y-0 left-0 z-30 flex w-[260px] flex-col border-r border-[var(--border)] bg-[var(--surface-muted)]/75 md:static md:z-auto',
         isSidebarOpen ? 'translate-x-0' : '-translate-x-full md:w-0 md:border-none'
       ]"
     >
@@ -4086,14 +2958,14 @@ onBeforeUnmount(() => {
         <!-- Sidebar Header: New Chat & Toggle -->
         <div class="p-3 flex items-center gap-2">
           <button
-            class="motion-surface flex h-9 flex-1 items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-white text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 hover:text-zinc-900"
+            class="motion-surface flex h-9 flex-1 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--app-bg)] text-sm font-medium text-[var(--text-muted)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
             @click="createNewSession"
           >
             <Plus class="h-4 w-4" />
             新对话
           </button>
           <button
-            class="motion-surface flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-500 shadow-sm hover:bg-zinc-50 hover:text-zinc-900"
+            class="motion-surface flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--app-bg)] text-[var(--text-subtle)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
             @click="isSidebarOpen = false"
             title="关闭侧边栏"
           >
@@ -4106,8 +2978,9 @@ onBeforeUnmount(() => {
           <div class="relative">
             <input
               type="text"
+              v-model="sidebarSearch"
               placeholder="搜索会话..."
-              class="motion-field h-8 w-full rounded-md border border-zinc-200 bg-white pl-3 pr-3 text-sm text-zinc-700 placeholder-zinc-400 focus:border-zinc-300 focus:outline-none focus:ring-2 focus:ring-zinc-100"
+              class="motion-field h-8 w-full rounded-md border border-[var(--border)] bg-[var(--app-bg)] pl-3 pr-3 text-sm text-[var(--text-muted)] placeholder-[var(--text-subtle)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-2 focus:ring-[var(--ring)]"
             />
           </div>
         </div>
@@ -4116,33 +2989,33 @@ onBeforeUnmount(() => {
         <div class="flex-1 overflow-y-auto px-2 pb-2 space-y-1 custom-scrollbar">
           <TransitionGroup name="list-stagger" tag="div" class="space-y-1">
             <div
-              v-for="session in sessions"
+              v-for="session in filteredSessions"
               :key="session.id"
               role="button"
               tabindex="0"
               class="motion-list-item group relative flex w-full cursor-pointer flex-col rounded-lg px-3 py-2.5 text-left"
-              :class="currentSessionId === session.id ? 'bg-zinc-200/70 shadow-sm ring-1 ring-white/70' : 'hover:bg-zinc-200/40'"
+              :class="currentSessionId === session.id ? 'bg-[var(--surface-soft)]/70 shadow-sm ring-1 ring-white/70 dark:ring-white/10' : 'hover:bg-[var(--surface-soft)]/40'"
               @click="switchSession(session.id)"
               @keydown.enter="switchSession(session.id)"
             >
               <div class="flex w-full items-center justify-between">
-                <span class="truncate pr-4 text-sm font-medium text-zinc-800" :class="currentSessionId === session.id ? 'text-zinc-900' : ''">{{ session.title }}</span>
+                <span class="truncate pr-4 text-sm font-medium text-[var(--text)]" :class="currentSessionId === session.id ? 'text-[var(--text)]' : ''">{{ session.title }}</span>
                 <button
-                  class="motion-icon absolute right-2 rounded-md p-1 text-zinc-400 opacity-0 hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                  class="motion-icon absolute right-2 rounded-md p-1 text-[var(--text-subtle)] opacity-0 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400 group-hover:opacity-100"
                   @click.stop="deleteSession(session.id, $event)"
                 >
                   <Trash2 class="h-3.5 w-3.5" />
                 </button>
               </div>
-              <span class="mt-0.5 text-[11px] text-zinc-400">{{ formatSessionTime(session.updatedAt) }}</span>
+              <span class="mt-0.5 text-[11px] text-[var(--text-subtle)]">{{ formatSessionTime(session.updatedAt) }}</span>
             </div>
           </TransitionGroup>
         </div>
         
         <!-- Settings Footer (Optional but good for config) -->
-        <div class="p-3 border-t border-zinc-200/80">
+        <div class="p-3 border-t border-[var(--border)]/80">
           <button 
-            class="motion-list-item flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-900"
+            class="motion-list-item flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]"
             @click="openSettings('tools')"
           >
             <Settings class="h-4 w-4" />
@@ -4153,20 +3026,20 @@ onBeforeUnmount(() => {
     </aside>
 
     <!-- Main Content -->
-    <main class="relative flex-1 flex flex-col min-w-0 bg-white">
+    <main class="relative flex-1 flex flex-col min-w-0 bg-[var(--app-bg)]">
       <!-- Header -->
-      <header class="h-14 flex items-center justify-between px-4 border-b border-zinc-100 flex-shrink-0 bg-white/80 backdrop-blur-md z-10 sticky top-0">
+      <header class="h-14 flex items-center justify-between px-4 border-b border-[var(--border)] flex-shrink-0 bg-[var(--app-bg)]/80 backdrop-blur-md z-10 sticky top-0">
         <div class="flex min-w-0 items-center gap-3">
           <button
             v-if="!isSidebarOpen"
-            class="motion-icon flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
+            class="motion-icon flex h-8 w-8 items-center justify-center rounded-md text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]"
             @click="isSidebarOpen = true"
           >
             <PanelLeftOpen class="h-5 w-5" />
           </button>
           <Transition name="title-fade" mode="out-in">
             <div :key="headerTitleKey" class="header-title-wrap min-w-0">
-              <h2 class="max-w-[200px] truncate text-sm font-semibold text-zinc-800 sm:max-w-xs">
+              <h2 class="max-w-[200px] truncate text-sm font-semibold text-[var(--text)] sm:max-w-xs">
                 {{ headerTitle }}
               </h2>
             </div>
@@ -4220,7 +3093,7 @@ onBeforeUnmount(() => {
                     </span>
                     <Check
                       v-if="selectedProviderId === provider.id && selectedModel === model"
-                      class="h-4 w-4 text-zinc-900"
+                      class="h-4 w-4 text-[var(--text)]"
                     />
                   </button>
                 </div>
@@ -4235,7 +3108,7 @@ onBeforeUnmount(() => {
           <button
             v-if="activeBashCount > 0 || activeBashShells.length > 0"
             type="button"
-            class="motion-chip relative flex items-center gap-1 rounded-md border border-sky-200/60 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100"
+            class="motion-chip relative flex items-center gap-1 rounded-md border border-sky-200/60 bg-sky-50 px-2 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100 dark:border-sky-400/30 dark:bg-sky-500/10 dark:text-sky-300 dark:hover:bg-sky-500/20"
             :title="`后台进程：${activeBashCount} 运行中 / 共 ${activeBashShells.length}`"
             @click="toggleBashShellsPanel"
           >
@@ -4244,8 +3117,8 @@ onBeforeUnmount(() => {
           </button>
           <button
             type="button"
-            class="motion-chip relative flex items-center gap-1 rounded-md border border-zinc-200/60 bg-white px-2 py-1 text-[11px] font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
-            :class="{ 'bg-zinc-900 text-white hover:bg-zinc-900 hover:text-white border-zinc-900': isTodoDrawerOpen }"
+            class="motion-chip relative flex items-center gap-1 rounded-md border border-[var(--border)]/60 bg-[var(--app-bg)] px-2 py-1 text-[11px] font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
+            :class="{ 'bg-[var(--accent)] text-[var(--shell-bg)] hover:bg-[var(--accent)] hover:text-[var(--shell-bg)] border-[var(--accent)]': isTodoDrawerOpen }"
             :title="hasCurrentTodos ? `任务：${currentTodoStats.in_progress} 进行中 / ${currentTodoStats.pending} 待办 / ${currentTodoStats.completed} 已完成` : '任务清单（空）'"
             @click="toggleTodoDrawer"
           >
@@ -4253,10 +3126,10 @@ onBeforeUnmount(() => {
             <span v-if="hasCurrentTodos">{{ currentTodoStats.completed }}/{{ currentTodoStats.total }}</span>
             <span v-else>任务</span>
           </button>
-          <span class="motion-chip rounded-md border border-zinc-200/50 bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-600">{{ currentProvider.name }}</span>
+          <span class="motion-chip rounded-md border border-[var(--border)]/50 bg-[var(--surface-strong)] px-2 py-1 text-[11px] font-medium text-[var(--text-muted)]">{{ currentProvider.name }}</span>
           <button
             type="button"
-            class="motion-icon flex h-8 w-8 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
+            class="motion-icon flex h-8 w-8 items-center justify-center rounded-lg text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]"
             title="打开设置"
             @click="openSettings('tools')"
           >
@@ -4269,14 +3142,14 @@ onBeforeUnmount(() => {
       <Transition name="dropdown-fade">
         <div
           v-if="isBashShellsOpen"
-          class="absolute right-4 top-16 z-30 w-[360px] rounded-xl border border-zinc-200 bg-white shadow-xl"
+          class="absolute right-4 top-16 z-30 w-[360px] rounded-xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl"
         >
-          <div class="flex items-center justify-between border-b border-zinc-100 px-3 py-2 text-xs font-semibold text-zinc-600">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-3 py-2 text-xs font-semibold text-[var(--text-muted)]">
             <span>后台 Bash（{{ activeBashShells.length }}）</span>
             <div class="flex items-center gap-1">
               <button
                 type="button"
-                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]"
                 title="刷新"
                 @click="refreshActiveBashShells"
               >
@@ -4284,7 +3157,7 @@ onBeforeUnmount(() => {
               </button>
               <button
                 type="button"
-                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                class="motion-icon flex h-6 w-6 items-center justify-center rounded text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]"
                 title="关闭"
                 @click="isBashShellsOpen = false"
               >
@@ -4293,32 +3166,32 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="max-h-80 overflow-auto px-3 py-2 text-xs custom-scrollbar">
-            <p v-if="!activeBashShells.length" class="py-4 text-center text-zinc-400">当前没有后台进程</p>
+            <p v-if="!activeBashShells.length" class="py-4 text-center text-[var(--text-subtle)]">当前没有后台进程</p>
             <div v-else class="flex flex-col gap-2">
               <div
                 v-for="shell in activeBashShells"
                 :key="shell.bashId"
-                class="rounded-lg border border-zinc-100 bg-zinc-50/60 p-2"
+                class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/60 p-2"
               >
                 <div class="flex items-center justify-between gap-2">
-                  <span class="font-mono text-[11px] text-zinc-500 truncate">{{ shell.bashId }}</span>
+                  <span class="font-mono text-[11px] text-[var(--text-subtle)] truncate">{{ shell.bashId }}</span>
                   <span
                     class="rounded-full px-2 py-0.5 text-[10px] font-medium"
                     :class="{
-                      'bg-sky-100 text-sky-700': shell.status === 'running',
-                      'bg-zinc-100 text-zinc-600': shell.status === 'completed' || shell.status === 'exited',
-                      'bg-rose-100 text-rose-700': shell.status === 'killed' || shell.status === 'error',
+                      'bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300': shell.status === 'running',
+                      'bg-[var(--surface-strong)] text-[var(--text-muted)]': shell.status === 'completed' || shell.status === 'exited',
+                      'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300': shell.status === 'killed' || shell.status === 'error',
                     }"
                   >{{ shell.status }}</span>
                 </div>
-                <p class="mt-1 break-all font-mono text-[11px] text-zinc-700">{{ shell.command }}</p>
-                <p v-if="shell.description" class="mt-0.5 text-[11px] text-zinc-500">{{ shell.description }}</p>
-                <div class="mt-2 flex items-center justify-between text-[10px] text-zinc-400">
+                <p class="mt-1 break-all font-mono text-[11px] text-[var(--text-muted)]">{{ shell.command }}</p>
+                <p v-if="shell.description" class="mt-0.5 text-[11px] text-[var(--text-subtle)]">{{ shell.description }}</p>
+                <div class="mt-2 flex items-center justify-between text-[10px] text-[var(--text-subtle)]">
                   <span>pid {{ shell.pid ?? '-' }} · 启动 {{ new Date(shell.startedAt).toLocaleTimeString() }}</span>
                   <button
                     v-if="shell.status === 'running'"
                     type="button"
-                    class="rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 hover:bg-rose-100"
+                    class="rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 hover:bg-rose-100 dark:border-rose-400/30 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20"
                     @click="killBackgroundBashShell(shell.bashId)"
                   >
                     终止
@@ -4334,17 +3207,17 @@ onBeforeUnmount(() => {
       <Transition name="dropdown-fade">
         <aside
           v-if="isTodoDrawerOpen"
-          class="absolute right-0 top-14 bottom-0 z-20 flex w-[320px] flex-col border-l border-zinc-200 bg-white/95 backdrop-blur-md shadow-[-8px_0_24px_-16px_rgba(0,0,0,0.12)]"
+          class="absolute right-0 top-14 bottom-0 z-20 flex w-[320px] flex-col border-l border-[var(--border)] bg-[var(--app-bg)]/95 backdrop-blur-md shadow-[-8px_0_24px_-16px_rgba(0,0,0,0.12)]"
         >
-          <div class="flex items-center justify-between border-b border-zinc-100 px-4 py-3">
-            <div class="flex items-center gap-2 text-sm font-semibold text-zinc-800">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+            <div class="flex items-center gap-2 text-sm font-semibold text-[var(--text)]">
               <ListChecks class="h-4 w-4" />
               <span>任务清单</span>
-              <span class="rounded-full bg-zinc-100 px-2 py-0.5 text-[11px] font-medium text-zinc-600">{{ currentTodoStats.total }}</span>
+              <span class="rounded-full bg-[var(--surface-strong)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">{{ currentTodoStats.total }}</span>
             </div>
             <button
               type="button"
-              class="motion-icon flex h-7 w-7 items-center justify-center rounded text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+              class="motion-icon flex h-7 w-7 items-center justify-center rounded text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]"
               title="关闭"
               @click="isTodoDrawerOpen = false"
             >
@@ -4352,32 +3225,32 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <div class="flex-1 overflow-auto px-4 py-3 custom-scrollbar">
-            <p v-if="!hasCurrentTodos" class="mt-8 text-center text-xs text-zinc-400">
+            <p v-if="!hasCurrentTodos" class="mt-8 text-center text-xs text-[var(--text-subtle)]">
               还没有任务。模型可以用 TodoWriteTool 创建任务清单来推进多步工作。
             </p>
             <div v-else class="flex flex-col gap-2">
               <div
                 v-for="(todo, todoIndex) in currentSessionTodos"
                 :key="`${todoIndex}_${todo.content}`"
-                class="rounded-lg border border-zinc-100 bg-zinc-50/60 p-3"
+                class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)]/60 p-3"
                 :class="{
-                  'border-sky-200 bg-sky-50/80': todo.status === 'in_progress',
-                  'border-emerald-200 bg-emerald-50/60': todo.status === 'completed',
+                  'border-sky-200 bg-sky-50/80 dark:border-sky-400/30 dark:bg-sky-500/10': todo.status === 'in_progress',
+                  'border-emerald-200 bg-emerald-50/60 dark:border-emerald-400/25 dark:bg-emerald-500/10': todo.status === 'completed',
                 }"
               >
                 <div class="flex items-start gap-2">
-                  <CircleCheck v-if="todo.status === 'completed'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-600" />
-                  <CircleDot v-else-if="todo.status === 'in_progress'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-sky-600" />
-                  <Circle v-else class="mt-0.5 h-4 w-4 flex-shrink-0 text-zinc-400" />
+                  <CircleCheck v-if="todo.status === 'completed'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <CircleDot v-else-if="todo.status === 'in_progress'" class="mt-0.5 h-4 w-4 flex-shrink-0 text-sky-600 dark:text-sky-300" />
+                  <Circle v-else class="mt-0.5 h-4 w-4 flex-shrink-0 text-[var(--text-subtle)]" />
                   <div class="min-w-0 flex-1">
                     <p
-                      class="text-sm text-zinc-800"
+                      class="text-sm text-[var(--text)]"
                       :class="{
-                        'line-through text-zinc-500': todo.status === 'completed',
-                        'font-semibold text-sky-900': todo.status === 'in_progress',
+                        'line-through text-[var(--text-subtle)]': todo.status === 'completed',
+                        'font-semibold text-sky-900 dark:text-sky-200': todo.status === 'in_progress',
                       }"
                     >{{ todo.status === 'in_progress' ? todo.activeForm : todo.content }}</p>
-                    <p class="mt-0.5 text-[11px] text-zinc-400">
+                    <p class="mt-0.5 text-[11px] text-[var(--text-subtle)]">
                       <span v-if="todo.status === 'pending'">待办</span>
                       <span v-else-if="todo.status === 'in_progress'">进行中</span>
                       <span v-else>已完成</span>
@@ -4396,11 +3269,11 @@ onBeforeUnmount(() => {
           <Transition name="content-switch" mode="out-in">
             <div :key="hasMessages ? 'messages' : 'empty'" class="flex min-w-0 min-h-0 flex-1 flex-col">
               <!-- Empty State -->
-              <div v-if="!hasMessages" class="empty-state flex flex-1 flex-col items-center justify-center text-zinc-400">
-                <div class="empty-state-icon mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-200 bg-zinc-50 shadow-sm">
-                  <Bot class="h-6 w-6 text-zinc-400" />
+              <div v-if="!hasMessages" class="empty-state flex flex-1 flex-col items-center justify-center text-[var(--text-subtle)]">
+                <div class="empty-state-icon mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)] shadow-sm">
+                  <Bot class="h-6 w-6 text-[var(--text-subtle)]" />
                 </div>
-                <p class="text-[15px] font-medium text-zinc-500">有什么我可以帮您的？</p>
+                <p class="text-[15px] font-medium text-[var(--text-subtle)]">有什么我可以帮您的？</p>
               </div>
 
               <!-- Message List -->
@@ -4416,12 +3289,12 @@ onBeforeUnmount(() => {
                     <div
                       class="message-avatar-shell mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full shadow-sm"
                       :class="[
-                        message.role === 'user' ? 'bg-zinc-100 text-zinc-600 border border-zinc-200/50' : 
+                        message.role === 'user' ? 'bg-[var(--surface-strong)] text-[var(--text-muted)] border border-[var(--border)]/50' : 
                         message.role === 'system'
-                          ? 'bg-amber-50 text-amber-500 border border-amber-200/50'
+                          ? 'bg-amber-50 text-amber-500 border border-amber-200/50 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-400/30'
                           : message.role === 'tool'
-                            ? 'bg-sky-50 text-sky-600 border border-sky-200/60'
-                            : 'bg-zinc-900 text-zinc-50'
+                            ? 'bg-sky-50 text-sky-600 border border-sky-200/60 dark:bg-sky-500/15 dark:text-sky-300 dark:border-sky-400/30'
+                            : 'bg-[var(--accent)] text-[var(--shell-bg)]'
                       ]"
                     >
                       <User v-if="message.role === 'user'" class="h-4 w-4" />
@@ -4451,12 +3324,12 @@ onBeforeUnmount(() => {
                         class="message-bubble-shell text-[15px] leading-relaxed"
                         :class="[
                           message.role === 'user'
-                            ? 'rounded-2xl rounded-tr-sm bg-zinc-100 px-4 py-2.5 text-zinc-900'
+                            ? 'rounded-2xl rounded-tr-sm bg-[var(--surface-strong)] px-4 py-2.5 text-[var(--text)]'
                             : message.role === 'system'
-                              ? 'rounded-2xl rounded-tl-sm border border-amber-100 bg-amber-50/30 px-4 py-2.5 font-mono text-xs text-zinc-600'
+                              ? 'rounded-2xl rounded-tl-sm border border-amber-100 bg-amber-50/30 px-4 py-2.5 font-mono text-xs text-[var(--text-muted)] dark:border-amber-400/25 dark:bg-amber-500/10'
                               : message.role === 'tool'
-                                ? 'w-full py-1 text-zinc-800'
-                              : 'w-full py-1 text-zinc-800'
+                                ? 'w-full py-1 text-[var(--text)]'
+                              : 'w-full py-1 text-[var(--text)]'
                         ]"
                       >
                         <template v-if="message.role === 'assistant'">
@@ -4677,7 +3550,7 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Composer -->
-      <div class="px-4 pb-6 pt-2 bg-gradient-to-t from-white via-white to-transparent">
+      <div class="px-4 pb-6 pt-2 bg-gradient-to-t from-[var(--app-bg)] via-[var(--app-bg)] to-transparent">
         <div
           class="composer-root max-w-3xl mx-auto relative"
           :class="{ 'is-dragging': isComposerDragActive }"
@@ -4721,14 +3594,14 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <form
-            class="composer-form motion-surface relative flex items-center min-h-[52px] rounded-2xl border border-zinc-200 bg-zinc-50/50 shadow-sm"
+            class="composer-form motion-surface relative flex items-center min-h-[52px] rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/50 shadow-sm"
             @submit.prevent="sendMessage"
           >
             <textarea
               ref="textareaRef"
               v-model="input"
               rows="1"
-              class="w-full max-h-[200px] py-3 pl-4 pr-36 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 resize-none text-[15px] leading-[1.5] placeholder-zinc-400 custom-scrollbar rounded-2xl"
+              class="w-full max-h-[200px] py-3 pl-4 pr-36 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 resize-none text-[15px] leading-[1.5] placeholder-[var(--text-subtle)] custom-scrollbar rounded-2xl"
               :placeholder="`输入消息`"
               @keydown="handleComposerKeydown"
               @paste="handleComposerPaste"
@@ -4744,7 +3617,7 @@ onBeforeUnmount(() => {
               >
                 <button
                   type="button"
-                  class="motion-icon rounded-xl p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                  class="motion-icon rounded-xl p-2 text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]"
                   title="点击添加文件 · 悬停展开文件夹选项"
                   @click="triggerFileInput"
                 >
@@ -4773,7 +3646,7 @@ onBeforeUnmount(() => {
               </div>
               <button
                 type="button"
-                class="motion-icon rounded-xl p-2 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+                class="motion-icon rounded-xl p-2 text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]"
                 title="上传图片"
                 @click="triggerImageInput"
               >
@@ -4782,7 +3655,7 @@ onBeforeUnmount(() => {
               <button
                 :type="isCurrentSessionLoading ? 'button' : 'submit'"
                 class="motion-surface flex items-center justify-center rounded-xl p-2 shadow-sm"
-                :class="isCurrentSessionLoading ? 'bg-red-500 text-white hover:bg-red-600' : (input.trim() || composerAttachments.length) ? 'bg-zinc-900 text-zinc-50 hover:bg-zinc-800' : 'bg-zinc-200 text-zinc-400 cursor-not-allowed'"
+                :class="isCurrentSessionLoading ? 'bg-red-500 text-white hover:bg-red-600 dark:bg-red-500/90 dark:hover:bg-red-500' : (input.trim() || composerAttachments.length) ? 'bg-[var(--accent)] text-[var(--shell-bg)] hover:bg-[var(--accent-strong)]' : 'bg-[var(--surface-soft)] text-[var(--text-subtle)] cursor-not-allowed'"
                 :disabled="!isCurrentSessionLoading && !input.trim() && !composerAttachments.length"
                 :title="isCurrentSessionLoading ? '中断当前会话请求' : '发送消息'"
                 @click="isCurrentSessionLoading ? stopCurrentSessionRequest() : undefined"
@@ -4821,7 +3694,7 @@ onBeforeUnmount(() => {
             <span>松开即附加到消息</span>
           </div>
           <div class="text-center mt-2.5">
-            <span class="text-[11px] text-zinc-400">支持拖拽 / 粘贴文件、文件夹与图片</span>
+            <span class="text-[11px] text-[var(--text-subtle)]">支持拖拽 / 粘贴文件、文件夹与图片</span>
           </div>
         </div>
       </div>
@@ -4925,11 +3798,11 @@ onBeforeUnmount(() => {
         class="settings-modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/24 p-3 sm:p-4 backdrop-blur-md"
         @click.self="closeSettings()"
       >
-        <div class="settings-modal-panel flex w-full flex-col overflow-hidden rounded-2xl border border-zinc-100 bg-white shadow-2xl">
+        <div class="settings-modal-panel flex w-full flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-2xl">
         <!-- Header -->
-        <div class="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
-          <h3 class="text-base font-semibold text-zinc-800">设置</h3>
-          <button @click="closeSettings()" class="motion-icon rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-[var(--border)] flex-shrink-0">
+          <h3 class="text-base font-semibold text-[var(--text)]">设置</h3>
+          <button @click="closeSettings()" class="motion-icon rounded-lg p-1.5 text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-muted)]">
             <X class="h-5 w-5" />
           </button>
         </div>
@@ -4937,10 +3810,10 @@ onBeforeUnmount(() => {
         <!-- Body -->
         <div class="settings-modal-body flex flex-1 overflow-hidden">
           <!-- Settings Sidebar -->
-          <div class="settings-tabs border-r border-zinc-100 bg-zinc-50/30 p-3 flex flex-col gap-1">
+          <div class="settings-tabs border-r border-[var(--border)] bg-[var(--surface-muted)]/30 p-3 flex flex-col gap-1">
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
-              :class="activeSettingsTab === 'general' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              :class="activeSettingsTab === 'general' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'general'"
             >
               <span class="inline-flex items-center gap-2">
@@ -4950,7 +3823,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
-              :class="activeSettingsTab === 'safety' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              :class="activeSettingsTab === 'safety' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'safety'"
             >
               <span class="inline-flex items-center gap-2">
@@ -4960,7 +3833,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
-              :class="activeSettingsTab === 'tools' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              :class="activeSettingsTab === 'tools' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'tools'"
             >
               <span class="inline-flex items-center gap-2">
@@ -4970,7 +3843,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
-              :class="activeSettingsTab === 'providers' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              :class="activeSettingsTab === 'providers' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'providers'"
             >
               <span class="inline-flex items-center gap-2">
@@ -4980,7 +3853,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
-              :class="activeSettingsTab === 'debug' ? 'bg-white shadow-sm text-zinc-900 border border-zinc-200' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+              :class="activeSettingsTab === 'debug' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'debug'; loadDebugLogs()"
             >
               <span class="inline-flex items-center gap-2">
@@ -4991,7 +3864,7 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- Settings Content -->
-          <div class="flex-1 flex flex-col bg-white overflow-hidden">
+          <div class="flex-1 flex flex-col bg-[var(--app-bg)] overflow-hidden">
             <Transition name="tab-panel" mode="out-in">
               <!-- General Tab -->
               <div v-if="activeSettingsTab === 'general'" key="general" class="settings-tab-panel p-4 md:p-6 flex-1 overflow-y-auto custom-scrollbar">
@@ -5012,7 +3885,7 @@ onBeforeUnmount(() => {
                       </button>
                     </div>
                     <div class="preference-row preference-row-plain">
-                      <span class="preference-row-title text-xs font-medium text-zinc-600">最大轮次</span>
+                      <span class="preference-row-title text-xs font-medium text-[var(--text-muted)]">最大轮次</span>
                       <div class="flex items-center gap-3">
                         <input
                           v-model.number="appSettingsDraft.maxToolCallRounds"
@@ -5126,6 +3999,38 @@ onBeforeUnmount(() => {
                     </div>
                     <div class="preference-row">
                       <div class="preference-row-copy">
+                        <span class="preference-row-title">深色模式</span>
+                        <span class="preference-row-hint">跟随系统 / 强制亮色 / 强制深色</span>
+                      </div>
+                      <div class="preference-segment preference-segment-inline">
+                        <button
+                          type="button"
+                          class="preference-segment-option"
+                          :class="{ 'is-active': appSettingsDraft.darkMode === 'auto' }"
+                          @click="appSettingsDraft.darkMode = 'auto'"
+                        >
+                          自动
+                        </button>
+                        <button
+                          type="button"
+                          class="preference-segment-option"
+                          :class="{ 'is-active': appSettingsDraft.darkMode === 'light' }"
+                          @click="appSettingsDraft.darkMode = 'light'"
+                        >
+                          亮色
+                        </button>
+                        <button
+                          type="button"
+                          class="preference-segment-option"
+                          :class="{ 'is-active': appSettingsDraft.darkMode === 'dark' }"
+                          @click="appSettingsDraft.darkMode = 'dark'"
+                        >
+                          深色
+                        </button>
+                      </div>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
                         <span class="preference-row-title">从主输入框启动时自动发送</span>
                         <span class="preference-row-hint">开启后，ZTools 主搜索框传入的文本会直接作为第一条消息发送，而不是先填入对话框。</span>
                       </div>
@@ -5140,9 +4045,9 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
-                  <div class="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4">
-                    <h4 class="text-sm font-semibold text-zinc-800">系统提示词</h4>
-                    <p class="mt-1.5 text-xs leading-6 text-zinc-500">
+                  <div class="rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/70 p-4">
+                    <h4 class="text-sm font-semibold text-[var(--text)]">系统提示词</h4>
+                    <p class="mt-1.5 text-xs leading-6 text-[var(--text-subtle)]">
                       定义 Agent 的角色与边界。保存后仅影响后续新对话。
                     </p>
                     <div class="mt-3 flex flex-wrap gap-2">
@@ -5150,7 +4055,7 @@ onBeforeUnmount(() => {
                         v-for="preset in systemPromptPresets"
                         :key="preset.id"
                         type="button"
-                        class="motion-surface rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900"
+                        class="motion-surface rounded-full border border-[var(--border)] bg-[var(--app-bg)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text)]"
                         @click="applySystemPromptPreset(preset.prompt)"
                       >
                         {{ preset.label }}
@@ -5158,28 +4063,28 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
 
-                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                  <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
                     <div class="flex items-center justify-between gap-3">
-                      <label class="block text-sm font-medium text-zinc-700">提示词内容</label>
-                      <span class="text-xs text-zinc-400">{{ systemPromptDraftLength }} 字</span>
+                      <label class="block text-sm font-medium text-[var(--text-muted)]">提示词内容</label>
+                      <span class="text-xs text-[var(--text-subtle)]">{{ systemPromptDraftLength }} 字</span>
                     </div>
                     <textarea
                       v-model="systemPromptDraft"
                       rows="8"
-                      class="motion-field custom-scrollbar mt-3 w-full resize-none rounded-2xl border border-zinc-200 bg-zinc-50 p-4 text-sm leading-6 text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                      class="motion-field custom-scrollbar mt-3 w-full resize-none rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)] p-4 text-sm leading-6 text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]"
                       placeholder="输入系统提示词，用于定义新对话的默认角色、风格与约束。"
                     ></textarea>
                     <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
                       <button
                         type="button"
-                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        class="motion-surface rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                         @click="resetSystemPromptDraft"
                       >
                         恢复默认
                       </button>
                       <span
                         class="rounded-full px-2.5 py-1 text-[11px] font-medium"
-                        :class="hasSystemPromptDraftChanges ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'"
+                        :class="hasSystemPromptDraftChanges ? 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300' : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300'"
                       >
                         {{ hasSystemPromptDraftChanges ? '有未保存修改' : '已同步' }}
                       </span>
@@ -5188,10 +4093,10 @@ onBeforeUnmount(() => {
 
                   <div
                     v-if="activeSessionPromptSnapshot"
-                    class="rounded-2xl border border-sky-200 bg-sky-50/70 p-4"
+                    class="rounded-2xl border border-sky-200 bg-sky-50/70 p-4 dark:border-sky-400/25 dark:bg-sky-500/10"
                   >
-                    <div class="mb-2 text-sm font-medium text-sky-900">当前会话锁定提示词</div>
-                    <pre class="tool-embed-code max-h-[160px] rounded-xl border border-sky-100 bg-white/80"><code>{{ activeSessionPromptSnapshot }}</code></pre>
+                    <div class="mb-2 text-sm font-medium text-sky-900 dark:text-sky-200">当前会话锁定提示词</div>
+                    <pre class="tool-embed-code max-h-[160px] rounded-xl border border-sky-100 bg-[var(--app-bg)]/80 dark:border-sky-400/20"><code>{{ activeSessionPromptSnapshot }}</code></pre>
                   </div>
                 </div>
               </div>
@@ -5204,8 +4109,8 @@ onBeforeUnmount(() => {
                       <Shield class="h-5 w-5" />
                     </div>
                     <div class="safety-hero-copy">
-                      <h4 class="text-sm font-semibold text-zinc-800">安全执行策略</h4>
-                      <p class="mt-1 text-xs leading-6 text-zinc-500">
+                      <h4 class="text-sm font-semibold text-[var(--text)]">安全执行策略</h4>
+                      <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
                         控制 AI 在调用 Bash 与文件写入工具时是否需要你确认。调用方必须自评风险等级（low / medium / high），当风险达到当前模式阈值时会弹出审阅弹窗。
                       </p>
                     </div>
@@ -5390,34 +4295,34 @@ onBeforeUnmount(() => {
                     </div>
                   </Transition>
 
-                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                  <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
                     <div class="flex items-center gap-2">
-                      <FolderOpen class="h-4 w-4 text-zinc-500" />
-                      <h4 class="text-sm font-semibold text-zinc-800">工作目录</h4>
+                      <FolderOpen class="h-4 w-4 text-[var(--text-subtle)]" />
+                      <h4 class="text-sm font-semibold text-[var(--text)]">工作目录</h4>
                       <span
                         v-if="!appSettingsDraft.workspaceRoot"
                         class="settings-status-chip settings-status-chip-pending"
                       >未设置</span>
                     </div>
-                    <p class="mt-1 text-xs leading-6 text-zinc-500">
+                    <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
                       AI 执行相对路径命令与文件操作时的根目录。建议设为项目目录，避免 AI 在系统默认路径（可能是系统盘根或 Program Files）下误操作。
                     </p>
                     <div class="mt-3 flex flex-wrap items-stretch gap-2">
                       <input
                         v-model.trim="appSettingsDraft.workspaceRoot"
                         type="text"
-                        class="motion-field h-10 flex-1 min-w-[240px] rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                        class="motion-field h-10 flex-1 min-w-[240px] rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]"
                         placeholder="例如 D:\\编程\\my-project"
                       />
                       <button
                         type="button"
-                        class="motion-surface rounded-xl border border-zinc-200 px-3 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        class="motion-surface rounded-xl border border-[var(--border)] px-3 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                         @click="clearWorkspaceRootDraft"
                       >
                         清空
                       </button>
                     </div>
-                    <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                    <div class="mt-3 flex flex-wrap items-center gap-2 text-xs text-[var(--text-subtle)]">
                       <span class="settings-status-chip settings-status-chip-muted">
                         当前生效：{{ currentWorkspaceCwd || '（未知）' }}
                       </span>
@@ -5432,11 +4337,11 @@ onBeforeUnmount(() => {
 
               <div v-else-if="activeSettingsTab === 'tools'" key="tools" class="settings-tab-panel p-4 md:p-6 flex-1 overflow-y-auto custom-scrollbar">
                 <div class="space-y-4">
-                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                  <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
                     <div class="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <h4 class="text-sm font-semibold text-zinc-800">本地工具总开关</h4>
-                        <p class="mt-1 text-xs leading-6 text-zinc-500">
+                        <h4 class="text-sm font-semibold text-[var(--text)]">本地工具总开关</h4>
+                        <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
                           {{ toolSettingsSummary }} · 已关闭 {{ draftDisabledToolCount }} 个。
                         </p>
                       </div>
@@ -5455,27 +4360,27 @@ onBeforeUnmount(() => {
                       </span>
                       <button
                         type="button"
-                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        class="motion-surface rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                         @click="setAllToolDraftEnabled(true)"
                       >全部启用</button>
                       <button
                         type="button"
-                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        class="motion-surface rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                         @click="setAllToolDraftEnabled(false)"
                       >全部关闭</button>
                       <button
                         type="button"
-                        class="motion-surface rounded-lg border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                        class="motion-surface rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                         @click="resetToolDraftSelection"
                       >恢复默认</button>
                     </div>
                   </div>
 
-                  <div class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                  <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
                     <div class="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <h4 class="text-sm font-semibold text-zinc-800">Tavily 搜索密钥</h4>
-                        <p class="mt-1 text-xs leading-6 text-zinc-500">WebSearchTool 必需。</p>
+                        <h4 class="text-sm font-semibold text-[var(--text)]">Tavily 搜索密钥</h4>
+                        <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">WebSearchTool 必需。</p>
                       </div>
                       <span
                         class="settings-status-chip"
@@ -5487,7 +4392,7 @@ onBeforeUnmount(() => {
                     <input
                       v-model.trim="appSettingsDraft.tavilyApiKey"
                       type="password"
-                      class="motion-field mt-3 h-10 w-full rounded-xl border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                      class="motion-field mt-3 h-10 w-full rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]"
                       placeholder="tvly-..."
                     />
                   </div>
@@ -5495,12 +4400,12 @@ onBeforeUnmount(() => {
                   <section
                     v-for="group in toolCatalogGroups"
                     :key="group.id"
-                    class="rounded-2xl border border-zinc-200 bg-zinc-50/60 p-4"
+                    class="rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-4"
                   >
                     <div class="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <h4 class="text-sm font-semibold text-zinc-800">{{ group.label }}</h4>
-                        <p class="mt-1 text-xs leading-6 text-zinc-500">{{ group.description }}</p>
+                        <h4 class="text-sm font-semibold text-[var(--text)]">{{ group.label }}</h4>
+                        <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">{{ group.description }}</p>
                       </div>
                       <div class="flex flex-wrap items-center gap-2">
                         <span class="settings-status-chip settings-status-chip-muted">
@@ -5508,7 +4413,7 @@ onBeforeUnmount(() => {
                         </span>
                         <button
                           type="button"
-                          class="motion-surface rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-600 hover:border-zinc-300 hover:text-zinc-900"
+                          class="motion-surface rounded-lg border border-[var(--border)] bg-[var(--app-bg)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text)]"
                           @click="toggleToolCategoryDraft(group.id)"
                         >
                           {{ group.enabledCount === group.tools.length ? '关闭本组' : '启用本组' }}
@@ -5550,17 +4455,17 @@ onBeforeUnmount(() => {
               <!-- Providers Tab -->
               <div v-else-if="activeSettingsTab === 'providers'" key="providers" class="flex flex-1 overflow-hidden">
                 <!-- Providers List -->
-                <div class="flex w-[220px] flex-col border-r border-zinc-100 bg-zinc-50/50">
-                  <div class="flex items-center justify-between border-b border-zinc-100 p-3">
-                    <span class="text-xs font-semibold uppercase tracking-wider text-zinc-500">供应商列表</span>
+                <div class="flex w-[220px] flex-col border-r border-[var(--border)] bg-[var(--surface-muted)]/50">
+                  <div class="flex items-center justify-between border-b border-[var(--border)] p-3">
+                    <span class="text-xs font-semibold uppercase tracking-wider text-[var(--text-subtle)]">供应商列表</span>
                     <div class="flex items-center gap-1">
-                      <button @click="exportProviders" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="导出供应商配置">
+                      <button @click="exportProviders" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]" title="导出供应商配置">
                         <Download class="h-4 w-4" />
                       </button>
-                      <button @click="importProviders" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="导入供应商配置">
+                      <button @click="importProviders" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]" title="导入供应商配置">
                         <Upload class="h-4 w-4" />
                       </button>
-                      <button @click="addNewProvider" class="motion-icon rounded-md p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900" title="添加供应商">
+                      <button @click="addNewProvider" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]" title="添加供应商">
                         <Plus class="h-4 w-4" />
                       </button>
                     </div>
@@ -5573,13 +4478,13 @@ onBeforeUnmount(() => {
                         role="button"
                         tabindex="0"
                         class="motion-list-item group flex w-full cursor-pointer items-center justify-between rounded-lg border border-transparent px-3 py-2.5 text-left text-sm"
-                        :class="selectedProviderId === p.id ? 'border-zinc-200 bg-white font-medium text-zinc-900 shadow-sm' : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900'"
+                        :class="selectedProviderId === p.id ? 'border-[var(--border)] bg-[var(--app-bg)] font-medium text-[var(--text)] shadow-sm' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
                         @click="selectProvider(p.id)"
                         @keydown.enter="selectProvider(p.id)"
                       >
                         <span class="truncate pr-2">{{ p.name }}</span>
                         <button
-                          class="motion-icon rounded-md p-1 text-zinc-400 opacity-0 hover:bg-red-50 hover:text-red-500 group-hover:opacity-100"
+                          class="motion-icon rounded-md p-1 text-[var(--text-subtle)] opacity-0 hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10 dark:hover:text-red-400 group-hover:opacity-100"
                           @click.stop="removeProvider(p.id)"
                         >
                           <Trash2 class="h-3.5 w-3.5" />
@@ -5593,22 +4498,30 @@ onBeforeUnmount(() => {
                 <div class="custom-scrollbar flex-1 overflow-y-auto p-6">
                   <div v-if="currentProvider" class="max-w-md space-y-5">
                     <div>
-                      <label class="block text-sm font-medium text-zinc-700 mb-1.5">供应商名称</label>
-                      <input v-model="currentProvider.name" type="text" class="motion-field h-9 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100" />
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">供应商类型</label>
+                      <select v-model="currentProvider.type" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]">
+                        <option value="openai">OpenAI 兼容</option>
+                        <option value="anthropic">Anthropic</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">供应商名称</label>
+                      <input v-model="currentProvider.name" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" />
                     </div>
                     
                     <div>
-                      <label class="block text-sm font-medium text-zinc-700 mb-1.5">API Base URL</label>
-                      <input v-model="currentProvider.baseURL" type="text" class="motion-field h-9 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100" />
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">API Base URL</label>
+                      <input v-model="currentProvider.baseURL" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="OpenAI 兼容格式填写，Anthropic 可留空" />
                     </div>
                     
                     <div>
-                      <label class="block text-sm font-medium text-zinc-700 mb-1.5">API Key</label>
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">API Key</label>
                       <div class="relative flex items-center">
-                        <input v-model="currentProvider.apiKey" :type="currentProvider.showApiKey ? 'text' : 'password'" class="motion-field h-9 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 pr-10 text-sm font-mono text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100" />
+                        <input v-model="currentProvider.apiKey" :type="currentProvider.showApiKey ? 'text' : 'password'" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 pr-10 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" />
                         <button
                           type="button"
-                          class="motion-icon absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-zinc-400 hover:text-zinc-700"
+                          class="motion-icon absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text-muted)]"
                           @click="currentProvider.showApiKey = !currentProvider.showApiKey"
                           :title="currentProvider.showApiKey ? '隐藏密钥' : '显示密钥'"
                         >
@@ -5619,28 +4532,28 @@ onBeforeUnmount(() => {
                     </div>
 
                     <div>
-                      <label class="block text-sm font-medium text-zinc-700 mb-1.5">默认模型</label>
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">默认模型</label>
                       <div class="flex gap-2">
-                        <select v-model="selectedModel" class="motion-field h-9 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100">
+                        <select v-model="selectedModel" class="motion-field h-9 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]">
                           <option v-for="m in currentProvider.models" :key="m" :value="m">{{ m }}</option>
                         </select>
-                        <button @click="fetchModels" :disabled="isFetchingModels" class="motion-surface flex h-9 items-center justify-center rounded-lg border border-zinc-200 px-3 text-zinc-600 shadow-sm hover:bg-zinc-50 hover:text-zinc-900" title="同步模型">
+                        <button @click="fetchModels" :disabled="isFetchingModels" class="motion-surface flex h-9 items-center justify-center rounded-lg border border-[var(--border)] px-3 text-[var(--text-muted)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" title="同步模型">
                           <RefreshCw class="h-4 w-4" :class="{ 'spin-gentle': isFetchingModels }" />
                         </button>
                       </div>
                     </div>
 
                     <div>
-                      <label class="block text-sm font-medium text-zinc-700 mb-1.5">手动添加模型</label>
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">手动添加模型</label>
                       <div class="flex gap-2">
                         <input
                           v-model="manualModelInput"
                           type="text"
-                          class="motion-field h-9 flex-1 rounded-lg border border-zinc-200 bg-zinc-50 px-3 text-sm text-zinc-800 focus:bg-white focus:border-zinc-400 focus:outline-none focus:ring-4 focus:ring-zinc-100"
+                          class="motion-field h-9 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]"
                           placeholder="输入模型名称"
                           @keydown.enter.prevent="addManualModel"
                         />
-                        <button type="button" class="motion-surface h-9 rounded-lg border border-zinc-200 px-4 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 hover:text-zinc-900" @click="addManualModel">
+                        <button type="button" class="motion-surface h-9 rounded-lg border border-[var(--border)] px-4 text-sm font-medium text-[var(--text-muted)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" @click="addManualModel">
                           添加
                         </button>
                       </div>
@@ -5650,11 +4563,11 @@ onBeforeUnmount(() => {
               </div>
               <div v-else key="debug" class="flex h-full flex-col p-6">
                 <div class="mb-4 flex items-center justify-between">
-                  <h4 class="text-sm font-semibold text-zinc-800">结构化调试日志</h4>
+                  <h4 class="text-sm font-semibold text-[var(--text)]">结构化调试日志</h4>
                   <div class="flex items-center gap-2">
                     <button
                       type="button"
-                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-3 text-xs text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900"
+                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] px-3 text-xs text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
                       @click="loadDebugLogs"
                     >
                       <RefreshCw class="h-3.5 w-3.5" :class="{ 'spin-gentle': isLoadingDebugLogs }" />
@@ -5662,7 +4575,7 @@ onBeforeUnmount(() => {
                     </button>
                     <button
                       type="button"
-                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-zinc-200 px-3 text-xs text-zinc-600 hover:bg-red-50 hover:text-red-600"
+                      class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] px-3 text-xs text-[var(--text-muted)] hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
                       @click="clearDebugLogs"
                     >
                       <Trash2 class="h-3.5 w-3.5" />
@@ -5670,22 +4583,22 @@ onBeforeUnmount(() => {
                     </button>
                   </div>
                 </div>
-                <div class="debug-log-list custom-scrollbar flex-1 space-y-2 overflow-y-auto rounded-xl border border-zinc-200 bg-zinc-50/60 p-3">
+                <div class="debug-log-list custom-scrollbar flex-1 space-y-2 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-3">
                   <article
                     v-for="item in debugLogItems"
                     :key="item.id"
-                    class="debug-log-item rounded-lg border border-zinc-200 bg-white p-3"
+                    class="debug-log-item rounded-lg border border-[var(--border)] bg-[var(--app-bg)] p-3"
                   >
                     <div class="mb-1.5 flex items-center gap-2">
                       <span class="tool-status-chip" :class="item.level === 'error' ? 'tool-status-chip-error' : 'tool-status-chip-success'">
                         {{ item.level }}
                       </span>
-                      <span class="text-[11px] text-zinc-500">{{ item.ts }}</span>
+                      <span class="text-[11px] text-[var(--text-subtle)]">{{ item.ts }}</span>
                     </div>
-                    <div class="text-xs font-medium text-zinc-700">{{ item.scope }} / {{ item.event }}</div>
+                    <div class="text-xs font-medium text-[var(--text-muted)]">{{ item.scope }} / {{ item.event }}</div>
                     <pre class="tool-embed-code mt-2 max-h-[160px] rounded-lg"><code>{{ stringifyForBlock(item.payload) }}</code></pre>
                   </article>
-                  <div v-if="!debugLogItems.length" class="py-10 text-center text-sm text-zinc-400">
+                  <div v-if="!debugLogItems.length" class="py-10 text-center text-sm text-[var(--text-subtle)]">
                     暂无调试日志，执行一次消息发送或工具调用后会出现记录。
                   </div>
                 </div>
@@ -5694,9 +4607,9 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div class="px-5 py-4 border-t border-zinc-100 bg-zinc-50 flex justify-end gap-3 flex-shrink-0">
-          <button type="button" @click="closeSettings()" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-zinc-600 hover:bg-zinc-200/50 hover:text-zinc-900">取消</button>
-          <button type="button" @click="saveConfig" class="motion-surface flex items-center gap-2 rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-50 shadow-sm hover:bg-zinc-800">
+        <div class="px-5 py-4 border-t border-[var(--border)] bg-[var(--surface-muted)] flex justify-end gap-3 flex-shrink-0">
+          <button type="button" @click="closeSettings()" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]">取消</button>
+          <button type="button" @click="saveConfig" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)] px-2 py-2">
             <Check class="h-4 w-4" />
             保存配置
           </button>
@@ -5709,7 +4622,7 @@ onBeforeUnmount(() => {
     <Transition name="notice-float">
       <div v-if="notice" class="fixed top-4 right-4 z-50">
         <div class="notice-card-glass flex items-center gap-2 rounded-xl border px-4 py-3 shadow-lg"
-             :class="notice.type === 'success' ? 'border-emerald-200 text-emerald-800 bg-emerald-50' : notice.type === 'error' ? 'border-red-200 text-red-800 bg-red-50' : 'border-blue-200 text-blue-800 bg-blue-50'">
+             :class="notice.type === 'success' ? 'border-emerald-200 text-emerald-800 bg-emerald-50 dark:border-emerald-400/30 dark:text-emerald-200 dark:bg-emerald-500/15' : notice.type === 'error' ? 'border-red-200 text-red-800 bg-red-50 dark:border-red-400/30 dark:text-red-200 dark:bg-red-500/15' : 'border-blue-200 text-blue-800 bg-blue-50 dark:border-blue-400/30 dark:text-blue-200 dark:bg-blue-500/15'">
           <span class="text-sm font-medium">{{ notice.text }}</span>
         </div>
       </div>
