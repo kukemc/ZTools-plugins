@@ -149,9 +149,10 @@ export interface AppSettings {
   workspaceRoot: string
   launchAutoSend: boolean
   darkMode: 'auto' | 'light' | 'dark'
+  enableBashNotification: boolean
 }
 
-export type ToolCategoryId = 'environment' | 'file' | 'task'
+export type ToolCategoryId = 'environment' | 'file' | 'task' | 'memory'
 
 export interface ToolDefinitionSchema {
   type: 'object'
@@ -204,4 +205,19 @@ export interface DiscoveredSkill {
   description: string
   path: string
   entry: string
+}
+
+export interface MemoryBlock {
+  label: string
+  description: string
+  value: string
+  chars_current: number
+  chars_limit: number
+  read_only: boolean
+  updatedAt: number
+}
+
+export interface MemoryEditResult {
+  success: boolean
+  error?: string
 }

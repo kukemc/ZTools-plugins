@@ -16,6 +16,7 @@ import {
   Activity,
   AlertTriangle,
   Bot,
+  Brain,
   Bug,
   ChevronDown,
   Check,
@@ -47,7 +48,10 @@ import {
   Wrench,
   X,
   PanelLeftClose,
-  PanelLeftOpen
+  PanelLeftOpen,
+  Cpu,
+  FileText,
+  Pencil
 } from 'lucide-vue-next'
 
 import type {
@@ -57,7 +61,7 @@ import type {
   DebugLogEntry, SessionRuntimeState, TodoStatus, TodoItem,
   SafetyMode, ToolRiskLevel, AppSettings, ToolCategoryId,
   ToolConfirmationDecision, PendingToolConfirmation, ToolGateDecision,
-  DiscoveredSkill
+  DiscoveredSkill, MemoryBlock
 } from './types'
 
 import {
@@ -102,6 +106,10 @@ const manualModelInput = ref('')
 const showSettings = ref(false)
 const activeSettingsTab = ref('general')
 const isSidebarOpen = ref(true)
+const isCompactInput = ref(window.innerWidth < 850)
+const handleResize = () => {
+  isCompactInput.value = window.innerWidth < 850
+}
 const isTodoDrawerOpen = ref(false)
 const isBashShellsOpen = ref(false)
 const sidebarSearch = ref('')
@@ -116,6 +124,7 @@ const activeBashShells = ref<Array<{
   exitCode: number | null
 }>>([])
 let bashShellsPollTimer: ReturnType<typeof setInterval> | undefined
+
 const isFetchingModels = ref(false)
 const isModelMenuOpen = ref(false)
 const modelMenuSearch = ref('')
@@ -154,6 +163,323 @@ const isImportingSkill = ref(false)
 const isSavingSkill = ref(false)
 const standardSkillTemplates = ref<Array<{ name: string; description: string }>>([])
 const userHomedir = computed(() => environmentInfo.value.homedir || '')
+
+const memoryBlocksForSettings = ref<MemoryBlock[]>([])
+const showMemoryDialog = ref(false)
+const memoryDialogMode = ref<'create' | 'edit'>('create')
+const memoryEditTarget = ref<MemoryBlock | null>(null)
+const memoryForm = ref({ label: '', description: '', value: '', chars_limit: 5000, read_only: false })
+
+interface McpServer {
+  serverId: string
+  name: string
+  command: string
+  args: string[]
+  cwd: string
+  status: string
+  toolCount: number
+  tools: Array<{ name: string; description: string; inputSchema: any }>
+  error?: string
+  extraHeaders?: Record<string, string>
+  transport?: string
+  env?: Record<string, string>
+}
+
+const mcpServers = ref<McpServer[]>([])
+const showMcpAddDialog = ref(false)
+const showMcpImportDialog = ref(false)
+const showMcpLogDialog = ref(false)
+const showMcpEditDialog = ref(false)
+const mcpLogData = ref<{ serverId: string; name: string; status: string; error: string | null; logs: Array<{ channel: string; text: string; ts: number }> } | null>(null)
+const mcpAddForm = ref({ name: '', command: '', args: '', cwd: '' })
+const mcpEditJson = ref('')
+const mcpEditJsonError = ref('')
+const mcpEditOriginalServerId = ref('')
+const isConnectingMcp = ref(false)
+const mcpImportText = ref('')
+const mcpImportError = ref('')
+const isImportingMcp = ref(false)
+
+const totalMcpTools = computed(() => mcpServers.value.reduce((sum, s) => sum + (s.tools?.length || 0), 0))
+
+const refreshMcpServers = async () => {
+  const listMcpServers = (window as any).localTools?.listMcpServers
+  if (typeof listMcpServers !== 'function') return false
+  try {
+    const response = await listMcpServers()
+    if (response?.success && Array.isArray(response.data)) {
+      mcpServers.value = response.data
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+const connectMcpServer = async (options: { name?: string; command: string; args?: string[]; cwd?: string }) => {
+  const connect = (window as any).localTools?.connectMcp
+  if (typeof connect !== 'function') return { success: false, error: 'connectMcp not available' }
+  try {
+    const result = await connect(options)
+    await refreshMcpServers()
+    return result
+  } catch (error: any) {
+    return { success: false, error: error?.message || String(error) }
+  }
+}
+
+const disconnectMcpServer = async (serverId: string) => {
+  const disconnect = (window as any).localTools?.disconnectMcp
+  if (typeof disconnect !== 'function') return
+  try {
+    await disconnect({ serverId })
+    await refreshMcpServers()
+  } catch {
+    // ignore
+  }
+}
+
+const showMcpLogs = async (serverId: string) => {
+  const getLogs = (window as any).localTools?.getMcpServerLogs
+  if (typeof getLogs !== 'function') return
+  try {
+    const response = await getLogs({ serverId })
+    if (response?.success) {
+      mcpLogData.value = response.data
+      showMcpLogDialog.value = true
+    }
+  } catch {
+    // ignore
+  }
+}
+
+const openMcpEditDialog = (server: McpServer) => {
+  const config: any = {}
+  if (server.command?.startsWith('http')) {
+    config.url = server.command
+    if (server.extraHeaders) {
+      config.headers = server.extraHeaders
+    }
+    if (server.transport === 'sse') {
+      config.transport = 'sse'
+    }
+  } else {
+    config.command = server.command
+    if (server.args?.length) {
+      config.args = server.args
+    }
+    if (server.env) {
+      config.env = server.env
+    }
+    if (server.cwd) {
+      config.cwd = server.cwd
+    }
+  }
+  mcpEditJson.value = JSON.stringify({ mcpServers: { [server.name]: config } }, null, 2)
+  mcpEditJsonError.value = ''
+  mcpEditOriginalServerId.value = server.serverId
+  showMcpEditDialog.value = true
+}
+
+const updateMcpServer = async () => {
+  mcpEditJsonError.value = ''
+  let parsed: any
+  try {
+    parsed = JSON.parse(mcpEditJson.value)
+  } catch {
+    mcpEditJsonError.value = 'JSON 格式错误'
+    return
+  }
+
+  if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object') {
+    mcpEditJsonError.value = '缺少 mcpServers 对象'
+    return
+  }
+
+  const entries = Object.entries(parsed.mcpServers)
+  if (entries.length === 0) {
+    mcpEditJsonError.value = 'mcpServers 不能为空'
+    return
+  }
+
+  const [name, config] = entries[0] as [string, any]
+  if (!config || typeof config !== 'object') {
+    mcpEditJsonError.value = '配置格式错误'
+    return
+  }
+
+  isConnectingMcp.value = true
+  try {
+    const disconnect = (window as any).localTools?.disconnectMcp
+    if (typeof disconnect === 'function' && mcpEditOriginalServerId.value) {
+      const disconnectResult = await disconnect({ serverId: mcpEditOriginalServerId.value })
+      if (!disconnectResult?.success) {
+        mcpEditJsonError.value = disconnectResult?.error || '断开旧连接失败'
+        isConnectingMcp.value = false
+        return
+      }
+    }
+
+    const connect = (window as any).localTools?.connectMcp
+    if (typeof connect !== 'function') {
+      mcpEditJsonError.value = '连接功能不可用'
+      isConnectingMcp.value = false
+      return
+    }
+    let connectResult
+    if (config.url) {
+      connectResult = await connect({ name, url: config.url, headers: config.headers, transport: config.transport })
+    } else if (config.command) {
+      connectResult = await connect({ name, command: config.command, args: config.args, env: config.env, cwd: config.cwd })
+    }
+    if (!connectResult?.success) {
+      mcpEditJsonError.value = connectResult?.error || '连接失败'
+      isConnectingMcp.value = false
+      return
+    }
+    await refreshMcpServers()
+    mcpEditJson.value = ''
+    mcpEditOriginalServerId.value = ''
+    showMcpEditDialog.value = false
+    showNotice('MCP Server 更新成功', 'success')
+  } catch (error: any) {
+    mcpEditJsonError.value = error?.message || '更新失败'
+  } finally {
+    isConnectingMcp.value = false
+  }
+}
+
+const addMcpServer = async () => {
+  if (!mcpAddForm.value.command.trim()) return
+  isConnectingMcp.value = true
+  try {
+    const args = mcpAddForm.value.args.trim() ? mcpAddForm.value.args.trim().split(/\s+/) : []
+    await connectMcpServer({
+      name: mcpAddForm.value.name.trim() || undefined,
+      command: mcpAddForm.value.command.trim(),
+      args,
+      cwd: mcpAddForm.value.cwd.trim() || undefined,
+    })
+    mcpAddForm.value = { name: '', command: '', args: '', cwd: '' }
+    showMcpAddDialog.value = false
+  } finally {
+    isConnectingMcp.value = false
+  }
+}
+
+const importMcpConfig = async () => {
+  const text = mcpImportText.value.trim()
+  if (!text) return
+  isImportingMcp.value = true
+  mcpImportError.value = ''
+  try {
+    let parsed: any
+    if (text.startsWith('{')) {
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        mcpImportError.value = 'JSON 格式解析失败，请检查语法'
+        isImportingMcp.value = false
+        return
+      }
+    } else if (text.startsWith('http://') || text.startsWith('https://')) {
+      parsed = { mcpServers: { unnamed: { url: text } } }
+    } else {
+      mcpImportError.value = '无法识别格式，请粘贴标准 MCP JSON 配置或以 http(s):// 开头的 URL'
+      isImportingMcp.value = false
+      return
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      mcpImportError.value = '配置解析结果无效'
+      isImportingMcp.value = false
+      return
+    }
+
+    const servers: Array<{ name?: string; command?: string; args?: string[]; url?: string; headers?: Record<string, string>; env?: Record<string, string>; cwd?: string; transport?: string }> = []
+
+    if (parsed.mcpServers && typeof parsed.mcpServers === 'object') {
+      for (const [name, config] of Object.entries(parsed.mcpServers)) {
+        if (!config || typeof config !== 'object') continue
+        const c = config as any
+        if (c.command) {
+          servers.push({
+            name: String(name),
+            command: String(c.command),
+            args: Array.isArray(c.args) ? c.args.map(String) : [],
+            env: c.env && typeof c.env === 'object' ? c.env : undefined,
+            cwd: typeof c.cwd === 'string' ? c.cwd : undefined,
+          })
+        } else if (c.url) {
+          servers.push({
+            name: String(name),
+            url: String(c.url),
+            headers: c.headers && typeof c.headers === 'object' ? c.headers : undefined,
+            transport: c.transport === 'sse' ? 'sse' : undefined,
+          })
+        }
+      }
+    }
+
+    if (servers.length === 0) {
+      mcpImportError.value = '未找到有效的 MCP Server 配置（需要 command 或 url 字段）'
+      isImportingMcp.value = false
+      return
+    }
+
+    let successCount = 0
+    let failCount = 0
+    let lastError = ''
+    for (const server of servers) {
+      const connectAsync = (window as any).localTools?.connectMcpAsync
+      let result
+      if (server.url) {
+        result = connectAsync({ name: server.name, url: server.url, headers: server.headers, transport: server.transport })
+      } else {
+        result = connectAsync({ name: server.name, command: server.command, args: server.args, env: server.env, cwd: server.cwd })
+      }
+      if (result?.success) {
+        successCount++
+      } else {
+        failCount++
+        lastError = result?.error || '未知错误'
+      }
+    }
+
+    // 保存 MCP 配置到 localStorage
+    try {
+      const savedMcp = localStorage.getItem('kuke_mcp_servers')
+      const saved = savedMcp ? JSON.parse(savedMcp) : {}
+      for (const server of servers) {
+        if (server.name && server.url) {
+          saved[server.name] = { url: server.url, headers: server.headers, transport: server.transport }
+        } else if (server.name && server.command) {
+          saved[server.name] = { command: server.command, args: server.args, env: server.env, cwd: server.cwd }
+        }
+      }
+      localStorage.setItem('kuke_mcp_servers', JSON.stringify(saved))
+    } catch (e) {
+      console.error('保存 MCP 配置失败:', e)
+    }
+
+    await refreshMcpServers()
+    mcpImportText.value = ''
+    showMcpImportDialog.value = false
+
+    if (failCount === 0) {
+      showNotice(`成功添加 ${successCount} 个 MCP Server，正在后台尝试连接...`, 'success')
+    } else {
+      showNotice(`添加完成：成功 ${successCount} 个，失败 ${failCount} 个 (${lastError})，正在后台尝试连接...`, 'error')
+    }
+  } catch (error: any) {
+    showNotice(`导入异常: ${error?.message || '未知错误'}`, 'error')
+    mcpImportText.value = ''
+    showMcpImportDialog.value = false
+  } finally {
+    isImportingMcp.value = false
+  }
+}
 
 const refreshDiscoveredSkills = async () => {
   const discover = (window as any).localTools?.discoverSkills
@@ -240,6 +566,88 @@ const viewSkill = async (entry: string, name: string) => {
 
 const closeSkillDetailDialog = () => {
   showSkillDetailDialog.value = false
+}
+
+const loadMemoryBlocksForSettings = async () => {
+  const lister = (window as any).localTools?.listMemoryBlocks
+  if (typeof lister !== 'function') return
+  try {
+    const response = await lister()
+    if (response?.success && Array.isArray(response.data)) {
+      memoryBlocksForSettings.value = response.data
+    }
+  } catch {
+    // ignore
+  }
+}
+
+const openMemoryCreateDialog = () => {
+  memoryDialogMode.value = 'create'
+  memoryEditTarget.value = null
+  memoryForm.value = { label: '', description: '', value: '', chars_limit: 5000, read_only: false }
+  showMemoryDialog.value = true
+}
+
+const openMemoryEditDialog = (block: MemoryBlock) => {
+  memoryDialogMode.value = 'edit'
+  memoryEditTarget.value = block
+  memoryForm.value = {
+    label: block.label,
+    description: block.description,
+    value: block.value,
+    chars_limit: block.chars_limit,
+    read_only: block.read_only,
+  }
+  showMemoryDialog.value = true
+}
+
+const closeMemoryDialog = () => {
+  showMemoryDialog.value = false
+}
+
+const submitMemoryForm = async () => {
+  const { label, description, value, chars_limit, read_only } = memoryForm.value
+  if (!label.trim()) {
+    showNotice('标签不能为空', 'error')
+    return
+  }
+  const setter = (window as any).localTools?.setMemoryBlock
+  if (typeof setter !== 'function') {
+    showNotice('当前环境不支持记忆操作', 'error')
+    return
+  }
+  try {
+    const response = await setter({ label: label.trim(), description: description.trim(), value, chars_limit, read_only })
+    if (response?.success) {
+      showNotice(memoryDialogMode.value === 'create' ? '记忆块创建成功' : '记忆块更新成功', 'success')
+      showMemoryDialog.value = false
+      await loadMemoryBlocksForSettings()
+    } else {
+      showNotice(response?.error || '操作失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '操作失败', 'error')
+  }
+}
+
+const deleteMemoryBlockFromSettings = async (label: string) => {
+  if (!confirm(`确定要删除记忆块「${label}」吗？此操作不可恢复。`)) return
+  const deleter = (window as any).localTools?.deleteMemoryBlock
+  if (typeof deleter !== 'function') {
+    showNotice('当前环境不支持记忆操作', 'error')
+    return
+  }
+  try {
+    const response = await deleter({ label })
+    if (response?.success) {
+      showNotice('记忆块已删除', 'success')
+      await loadMemoryBlocksForSettings()
+    } else {
+      showNotice(response?.error || '删除失败', 'error')
+    }
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : '删除失败', 'error')
+  }
 }
 
 const loadStandardSkillTemplates = async () => {
@@ -882,8 +1290,30 @@ const toolCatalogGroups = computed(() => (
     }
   })
 ))
-const enabledTools = computed(() => (
-  toolCatalog
+
+const mcpToolDefinitions = computed(() => {
+  const tools: Array<{
+    type: 'function'
+    function: { name: string; description: string; parameters: any }
+  }> = []
+  for (const server of mcpServers.value) {
+    if (server.status !== 'initialized' || !Array.isArray(server.tools)) continue
+    for (const tool of server.tools) {
+      tools.push({
+        type: 'function',
+        function: {
+          name: `mcp_${server.serverId}__${tool.name}`,
+          description: tool.description || `MCP tool from ${server.name}`,
+          parameters: tool.inputSchema || { type: 'object', properties: {} },
+        },
+      })
+    }
+  }
+  return tools
+})
+
+const enabledTools = computed(() => {
+  const localTools = toolCatalog
     .filter((tool) => appSettings.value.enabledToolNames.includes(tool.name))
     .map((tool) => ({
       type: 'function',
@@ -893,7 +1323,8 @@ const enabledTools = computed(() => (
         parameters: tool.parameters,
       },
     }))
-))
+  return [...localTools, ...mcpToolDefinitions.value]
+})
 
 const getToolDefinition = (toolName: string) => toolCatalogMap.get(toolName) || null
 
@@ -1192,6 +1623,39 @@ const buildSkillsBlock = (skills: DiscoveredSkill[]): string => {
   return lines.join('\n')
 }
 
+const buildMemoryBlock = (blocks: MemoryBlock[]): string => {
+  if (!blocks.length) return ''
+  const lines: string[] = []
+  lines.push('<memory_blocks>')
+  lines.push('以下是持久化的记忆信息，这些是跨会话的重要上下文。请在适当时机使用记忆工具（listMemoryBlocks/getMemoryBlock/setMemoryBlock/replaceMemoryBlockText/deleteMemoryBlock）来管理记忆。')
+  for (const b of blocks) {
+    lines.push(`  <memory>`)
+    lines.push(`    <label>${b.label}</label>`)
+    lines.push(`    <description>${b.description}</description>`)
+    lines.push(`    <value>${b.value}</value>`)
+    lines.push(`    <chars_current>${b.chars_current}</chars_current>`)
+    lines.push(`    <chars_limit>${b.chars_limit}</chars_limit>`)
+    lines.push(`    <read_only>${b.read_only}</read_only>`)
+    lines.push(`  </memory>`)
+  }
+  lines.push('</memory_blocks>')
+  return lines.join('\n')
+}
+
+const loadMemoryBlocksForPrompt = async (): Promise<MemoryBlock[]> => {
+  const lister = (window as any).localTools?.listMemoryBlocks
+  if (typeof lister !== 'function') return []
+  try {
+    const response = await lister()
+    if (response?.success && Array.isArray(response.data)) {
+      return response.data as MemoryBlock[]
+    }
+  } catch {
+    // ignore
+  }
+  return []
+}
+
 const resolveSystemPromptPlaceholders = (raw: string): string => {
   if (!raw) {
     return raw
@@ -1216,6 +1680,14 @@ const saveConfig = () => {
   showSettings.value = false
   showNotice('配置已保存，新对话会使用当前系统提示词、工具清单与交互设置。', 'success')
   void applyWorkspaceRootFromSettings()
+  syncBashNotificationSetting()
+}
+
+const syncBashNotificationSetting = () => {
+  const setter = (window as any).localTools?.setBashNotificationEnabled
+  if (typeof setter === 'function') {
+    setter(appSettings.value.enableBashNotification)
+  }
 }
 
 const focusComposer = () => {
@@ -1794,6 +2266,10 @@ const executeLocalTool = async (
   availableTool: any,
   context: { sessionId: string; messageId: string } | null = null,
 ) => {
+  if (typeof functionName === 'string' && functionName.startsWith('mcp_')) {
+    return await availableTool(parsedArguments)
+  }
+
   if (typeof availableTool !== 'function') {
     return {
       success: false,
@@ -2012,7 +2488,41 @@ const executeLocalTool = async (
       }
       return result
     }
-    case 'FileEditTool':
+    case 'listMemoryBlocks': {
+      return await availableTool()
+    }
+    case 'getMemoryBlock': {
+      const label = getArgumentByAliases(parsedArguments, ['label', 'name', 'key'])
+      return await availableTool({ label: label === undefined || label === null ? '' : String(label) })
+    }
+    case 'setMemoryBlock': {
+      const label = getArgumentByAliases(parsedArguments, ['label', 'name', 'key'])
+      const description = getArgumentByAliases(parsedArguments, ['description', 'desc'])
+      const value = getArgumentByAliases(parsedArguments, ['value', 'content', 'text'])
+      const chars_limit = getArgumentByAliases(parsedArguments, ['chars_limit', 'charsLimit', 'limit'])
+      const read_only = getArgumentByAliases(parsedArguments, ['read_only', 'readOnly', 'readonly'])
+      return await availableTool({
+        label: label === undefined || label === null ? '' : String(label),
+        description: description === undefined || description === null ? '' : String(description),
+        value: value === undefined || value === null ? '' : String(value),
+        chars_limit: chars_limit === undefined || chars_limit === null ? undefined : Number(chars_limit),
+        read_only: Boolean(read_only),
+      })
+    }
+    case 'replaceMemoryBlockText': {
+      const label = getArgumentByAliases(parsedArguments, ['label', 'name', 'key'])
+      const oldText = getArgumentByAliases(parsedArguments, ['oldText', 'old_text', 'oldString', 'search'])
+      const newText = getArgumentByAliases(parsedArguments, ['newText', 'new_text', 'newString', 'replace'])
+      return await availableTool({
+        label: label === undefined || label === null ? '' : String(label),
+        oldText: oldText === undefined || oldText === null ? '' : String(oldText),
+        newText: newText === undefined || newText === null ? '' : String(newText),
+      })
+    }
+    case 'deleteMemoryBlock': {
+      const label = getArgumentByAliases(parsedArguments, ['label', 'name', 'key'])
+      return await availableTool({ label: label === undefined || label === null ? '' : String(label) })
+    }
     default: {
       const enrichedArgs = context
         ? { ...parsedArguments, __context: context }
@@ -2493,6 +3003,18 @@ const addManualModel = () => {
   manualModelInput.value = ''
 }
 
+const removeModel = (modelToRemove: string) => {
+  if (!currentProvider.value) return
+  if (currentProvider.value.models.length <= 1) {
+    showNotice('至少保留一个模型。', 'error')
+    return
+  }
+  currentProvider.value.models = currentProvider.value.models.filter((m) => m !== modelToRemove)
+  if (selectedModel.value === modelToRemove) {
+    selectedModel.value = currentProvider.value.models[0] || ''
+  }
+}
+
 const addNewProvider = () => {
   const newId = `provider_${Date.now()}`
   providers.value.push({
@@ -2715,6 +3237,7 @@ const generateSessionTitleAsync = async (sessionId: string, seedContent: string)
         apiKey: currentProvider.value.apiKey,
         baseURL: currentProvider.value.baseURL,
         model: selectedModel.value,
+        providerType: currentProvider.value.type,
       },
       [
         {
@@ -2790,7 +3313,14 @@ const sendMessage = async () => {
   const sessionSystemPrompt = ensureSessionSystemPrompt(sessionId)
   const resolvedSystemPrompt = resolveSystemPromptPlaceholders(sessionSystemPrompt)
   const skillsBlock = buildSkillsBlock(discoveredSkills.value)
-  const finalSystemPrompt = skillsBlock ? `${resolvedSystemPrompt}\n\n${skillsBlock}` : resolvedSystemPrompt
+
+  const memoryBlocksForPrompt = await loadMemoryBlocksForPrompt()
+  const memoryBlock = buildMemoryBlock(memoryBlocksForPrompt)
+  let finalSystemPrompt = skillsBlock ? `${resolvedSystemPrompt}\n\n${skillsBlock}` : resolvedSystemPrompt
+  if (memoryBlock) {
+    finalSystemPrompt = `${finalSystemPrompt}\n\n${memoryBlock}`
+  }
+
   const apiMessages: any[] = [
     { role: 'system', content: finalSystemPrompt },
   ]
@@ -2902,9 +3432,35 @@ const sendMessage = async () => {
         }
         const functionName = toolCall.function?.name ?? toolCall.name ?? (toolCall as any).function_name
         const rawArguments = toolCall.function?.arguments ?? toolCall.arguments ?? (toolCall as any).arguments_json ?? '{}'
-        const availableTool = (window as any).localTools?.[functionName]
         const parsedArguments = tryParseJson(rawArguments)
-        const toolCallId = String(toolCall.id ?? `tool_${currentRound}_${toolIndex}`)
+        const isMcpTool = typeof functionName === 'string' && functionName.startsWith('mcp_')
+        const mcpToolWrapper = isMcpTool && parsedArguments
+          ? (async (_args: any) => {
+              const MCP_PREFIX = 'mcp_'
+              const SEP = '__'
+              if (functionName.startsWith(MCP_PREFIX)) {
+                const rest = functionName.substring(MCP_PREFIX.length)
+                const lastSepIndex = rest.lastIndexOf(SEP)
+                if (lastSepIndex > 0) {
+                  const serverId = rest.substring(0, lastSepIndex)
+                  const toolName = rest.substring(lastSepIndex + SEP.length)
+                  const callMcp = (window as any).localTools?.callMcpTool
+                  if (typeof callMcp === 'function') {
+                    return await callMcp({ serverId, toolName, arguments: _args || {} })
+                  }
+                }
+              }
+              return { success: false, error: 'MCP tool handler not found' }
+            })
+          : null
+        const availableTool = mcpToolWrapper ?? (window as any).localTools?.[functionName]
+        const rawToolCallId = typeof toolCall.id === 'string'
+          ? toolCall.id.trim()
+          : toolCall.id === undefined || toolCall.id === null
+            ? ''
+            : String(toolCall.id).trim()
+        const toolCallId = rawToolCallId || `tool_${currentRound}_${toolIndex}`
+        ;(toolCall as any).id = toolCallId
         appendToolInvocation(sessionId, assistantMessageId, {
           id: toolCallId,
           callId: toolCallId,
@@ -2989,7 +3545,7 @@ const sendMessage = async () => {
 
         apiMessages.push({
           role: 'tool',
-          tool_call_id: toolCall.id ?? toolCallId,
+          tool_call_id: toolCallId,
           name: functionName,
           content: serializedToolResult,
         })
@@ -3063,6 +3619,12 @@ const sendMessage = async () => {
     }
 
     updateCurrentSession(sessionId)
+    if (appSettings.value.enableBashNotification && currentSessionId.value === sessionId) {
+      const sender = (window as any).localTools?.sendNotification
+      if (typeof sender === 'function') {
+        sender({ title: 'AI 任务完成', body: '点击查看结果' })
+      }
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : '请求失败'
     mutateSessionMessages(sessionId, (messageList) => {
@@ -3091,8 +3653,10 @@ const sendMessage = async () => {
 
 onMounted(() => {
   ensureProviderSelection()
+  syncBashNotificationSetting()
   loadSessionsFromStorage()
   document.addEventListener('pointerdown', handleDocumentPointerDown)
+  window.addEventListener('resize', handleResize)
   document.addEventListener('keydown', handleGlobalKeydown)
   document.addEventListener('click', handleDocumentCopyClick)
   void maybeLoadDebugLogs(true)
@@ -3140,6 +3704,26 @@ onMounted(() => {
 
   void applyWorkspaceRootFromSettings()
 
+  // 自动加载保存的 MCP 配置
+  try {
+    const savedMcp = localStorage.getItem('kuke_mcp_servers')
+    if (savedMcp) {
+      const saved = JSON.parse(savedMcp)
+      const entries = Object.entries(saved)
+      if (entries.length > 0) {
+        for (const [name, config] of entries) {
+          const c = config as any
+          if (c.url) {
+            ;(window as any).localTools?.connectMcpAsync?.({ name, url: c.url, headers: c.headers, transport: c.transport })
+          } else if (c.command) {
+            ;(window as any).localTools?.connectMcpAsync?.({ name, command: c.command, args: c.args, env: c.env, cwd: c.cwd })
+          }
+        }
+        setTimeout(() => refreshMcpServers(), 1000)
+      }
+    }
+  } catch { /* best effort */ }
+
   try {
     const discover = (window as any).localTools?.discoverSkills
     if (typeof discover === 'function') {
@@ -3162,6 +3746,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
   document.removeEventListener('keydown', handleGlobalKeydown)
   document.removeEventListener('click', handleDocumentCopyClick)
+  window.removeEventListener('resize', handleResize)
   if (noticeTimer) {
     clearTimeout(noticeTimer)
   }
@@ -3262,7 +3847,7 @@ onBeforeUnmount(() => {
         <div class="p-3 border-t border-[var(--border)]/80">
           <button 
             class="motion-list-item flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]"
-            @click="openSettings('tools')"
+            @click="openSettings('general')"
           >
             <Settings class="h-4 w-4" />
             设置
@@ -3377,7 +3962,7 @@ onBeforeUnmount(() => {
             type="button"
             class="motion-icon flex h-8 w-8 items-center justify-center rounded-lg text-[var(--text-subtle)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]"
             title="打开设置"
-            @click="openSettings('tools')"
+            @click="openSettings('general')"
           >
             <Settings class="h-4 w-4" />
           </button>
@@ -3848,7 +4433,7 @@ onBeforeUnmount(() => {
               v-model="input"
               rows="1"
               class="w-full max-h-[200px] py-3 pl-4 pr-36 bg-transparent border-0 outline-none focus:outline-none focus:ring-0 resize-none text-[15px] leading-[1.5] placeholder-[var(--text-subtle)] custom-scrollbar rounded-2xl"
-              :placeholder="`输入消息`"
+              :placeholder="isCompactInput ? '支持拖拽 / 粘贴文件、文件夹与图片' : '输入消息'"
               @keydown="handleComposerKeydown"
               @paste="handleComposerPaste"
               style="field-sizing: content;"
@@ -3946,7 +4531,7 @@ onBeforeUnmount(() => {
             <Paperclip class="h-5 w-5" />
             <span>松开即附加到消息</span>
           </div>
-          <div class="text-center mt-2.5">
+          <div v-if="!isCompactInput" class="text-center mt-2.5">
             <span class="text-[11px] text-[var(--text-subtle)]">支持拖拽 / 粘贴文件、文件夹与图片</span>
           </div>
         </div>
@@ -4106,12 +4691,32 @@ onBeforeUnmount(() => {
             </button>
             <button
               class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
+              :class="activeSettingsTab === 'mcp' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
+              @click="activeSettingsTab = 'mcp'; refreshMcpServers()"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Cpu class="h-4 w-4" />
+                MCP
+              </span>
+            </button>
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
               :class="activeSettingsTab === 'providers' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
               @click="activeSettingsTab = 'providers'"
             >
               <span class="inline-flex items-center gap-2">
                 <Server class="h-4 w-4" />
                 模型供应商
+              </span>
+            </button>
+            <button
+              class="motion-list-item settings-tab rounded-lg px-3 py-2 text-sm font-medium"
+              :class="activeSettingsTab === 'memory' ? 'bg-[var(--app-bg)] shadow-sm text-[var(--text)] border border-[var(--border)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-strong)] hover:text-[var(--text)]'"
+              @click="activeSettingsTab = 'memory'; loadMemoryBlocksForSettings()"
+            >
+              <span class="inline-flex items-center gap-2">
+                <Brain class="h-4 w-4" />
+                记忆管理
               </span>
             </button>
             <button
@@ -4204,6 +4809,20 @@ onBeforeUnmount(() => {
                         class="preference-toggle"
                         :class="{ 'is-active': appSettingsDraft.stopWhenToolError }"
                         @click="appSettingsDraft.stopWhenToolError = !appSettingsDraft.stopWhenToolError"
+                      >
+                        <span class="preference-toggle-thumb"></span>
+                      </button>
+                    </div>
+                    <div class="preference-row">
+                      <div class="preference-row-copy">
+                        <span class="preference-row-title">任务完成通知</span>
+                        <span class="preference-row-hint">AI 任务完成时显示 Windows 原生通知。</span>
+                      </div>
+                      <button
+                        type="button"
+                        class="preference-toggle"
+                        :class="{ 'is-active': appSettingsDraft.enableBashNotification }"
+                        @click="appSettingsDraft.enableBashNotification = !appSettingsDraft.enableBashNotification; syncBashNotificationSetting()"
                       >
                         <span class="preference-toggle-thumb"></span>
                       </button>
@@ -4795,7 +5414,7 @@ onBeforeUnmount(() => {
                     </div>
 
                     <div>
-                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">默认模型</label>
+                      <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">模型列表</label>
                       <div class="flex gap-2">
                         <select v-model="selectedModel" class="motion-field h-9 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]">
                           <option v-for="m in currentProvider.models" :key="m" :value="m">{{ m }}</option>
@@ -4803,6 +5422,24 @@ onBeforeUnmount(() => {
                         <button @click="fetchModels" :disabled="isFetchingModels" class="motion-surface flex h-9 items-center justify-center rounded-lg border border-[var(--border)] px-3 text-[var(--text-muted)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" title="同步模型">
                           <RefreshCw class="h-4 w-4" :class="{ 'spin-gentle': isFetchingModels }" />
                         </button>
+                      </div>
+                      <div v-if="currentProvider.models.length > 0" class="mt-2 flex flex-wrap gap-1.5">
+                        <span
+                          v-for="model in currentProvider.models"
+                          :key="model"
+                          class="inline-flex items-center gap-1 rounded-md bg-[var(--surface-muted)] px-2 py-1 text-xs text-[var(--text)]"
+                          :class="{ 'ring-1 ring-[var(--accent)]': model === selectedModel }"
+                        >
+                          <span class="max-w-[120px] truncate">{{ model }}</span>
+                          <button
+                            v-if="currentProvider.models.length > 1"
+                            class="ml-0.5 rounded-sm p-0.5 text-[var(--text-subtle)] hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                            title="删除模型"
+                            @click="removeModel(model)"
+                          >
+                            <X class="h-3 w-3" />
+                          </button>
+                        </span>
                       </div>
                     </div>
 
@@ -4819,6 +5456,79 @@ onBeforeUnmount(() => {
                         <button type="button" class="motion-surface h-9 rounded-lg border border-[var(--border)] px-4 text-sm font-medium text-[var(--text-muted)] shadow-sm hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" @click="addManualModel">
                           添加
                         </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Memory Tab -->
+              <div v-else-if="activeSettingsTab === 'memory'" key="memory" class="flex flex-1 overflow-hidden">
+                <div class="custom-scrollbar flex-1 overflow-y-auto p-6">
+                  <div class="max-w-3xl space-y-5">
+                    <!-- Header -->
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h4 class="text-sm font-semibold text-[var(--text)]">记忆块管理</h4>
+                        <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                          记忆用于存储跨会话的持久化信息。AI 可以自主创建和管理记忆。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--accent)] px-3 text-xs text-[var(--shell-bg)] hover:bg-[var(--accent-strong)]"
+                        @click="openMemoryCreateDialog"
+                      >
+                        <Plus class="h-3.5 w-3.5" />
+                        新建记忆
+                      </button>
+                    </div>
+
+                    <!-- Memory Blocks List -->
+                    <div class="space-y-3">
+                      <div
+                        v-for="block in memoryBlocksForSettings"
+                        :key="block.label"
+                        class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-4"
+                      >
+                        <div class="flex items-start justify-between gap-3">
+                          <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 flex-wrap">
+                              <span class="text-sm font-medium text-[var(--text)]">{{ block.label }}</span>
+                              <span v-if="block.read_only" class="settings-status-chip settings-status-chip-muted">只读</span>
+                              <span class="text-xs text-[var(--text-subtle)]">{{ block.chars_current }}/{{ block.chars_limit }} 字符</span>
+                            </div>
+                            <p class="mt-1 text-xs text-[var(--text-subtle)]">{{ block.description }}</p>
+                          </div>
+                          <div class="flex items-center gap-1 flex-shrink-0">
+                            <button
+                              type="button"
+                              class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]"
+                              title="编辑"
+                              @click="openMemoryEditDialog(block)"
+                            >
+                              <Pencil class="h-4 w-4" />
+                            </button>
+                            <button
+                              v-if="!block.read_only"
+                              type="button"
+                              class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                              title="删除"
+                              @click="deleteMemoryBlockFromSettings(block.label)"
+                            >
+                              <Trash2 class="h-4 w-4" />
+                            </button>
+                          </div>
+                        </div>
+                        <div v-if="block.value" class="mt-3 rounded-lg border border-[var(--border)] bg-[var(--app-bg)] p-3">
+                          <pre class="text-xs text-[var(--text-muted)] whitespace-pre-wrap break-all max-h-32 overflow-y-auto custom-scrollbar">{{ block.value }}</pre>
+                        </div>
+                      </div>
+
+                      <div v-if="!memoryBlocksForSettings.length" class="rounded-xl border border-dashed border-[var(--border)] py-12 text-center">
+                        <Brain class="mx-auto h-8 w-8 text-[var(--text-subtle)] opacity-50" />
+                        <p class="mt-2 text-sm text-[var(--text-subtle)]">暂无记忆块</p>
+                        <p class="mt-1 text-xs text-[var(--text-subtle)]">点击「新建记忆」创建第一个记忆块</p>
                       </div>
                     </div>
                   </div>
@@ -4955,6 +5665,129 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
+              <!-- MCP Tab -->
+              <div v-else-if="activeSettingsTab === 'mcp'" key="mcp" class="flex flex-1 overflow-hidden">
+                <div class="custom-scrollbar flex-1 overflow-y-auto p-6">
+                  <div class="max-w-2xl space-y-5">
+                    <!-- MCP Servers -->
+                    <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
+                      <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h4 class="text-sm font-semibold text-[var(--text)]">MCP Servers</h4>
+                          <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                            已连接 {{ mcpServers.length }} 个 MCP Server，共发现 {{ totalMcpTools }} 个工具。
+                          </p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <button
+                            type="button"
+                            class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] px-3 text-xs text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
+                            @click="refreshMcpServers"
+                          >
+                            <RefreshCw class="h-3.5 w-3.5" />
+                            刷新
+                          </button>
+                          <button
+                            type="button"
+                            class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--accent)] px-3 text-xs text-[var(--shell-bg)] hover:bg-[var(--accent-strong)]"
+                            @click="showMcpAddDialog = true"
+                          >
+                            <Plus class="h-3.5 w-3.5" />
+                            添加 Server
+                          </button>
+                        </div>
+                      </div>
+
+                      <div class="mt-4 space-y-2">
+                        <div
+                          v-for="server in mcpServers"
+                          :key="server.serverId"
+                          class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 p-3"
+                        >
+                          <div class="flex flex-wrap items-start justify-between gap-2">
+                            <div class="min-w-0 flex-1">
+                              <div class="flex items-center gap-2">
+                                <span class="text-sm font-medium text-[var(--text)]">{{ server.name }}</span>
+                                <span
+                                  class="settings-status-chip"
+                                  :class="{
+                                    'settings-status-chip-success': server.status === 'initialized' || server.status === 'connecting',
+                                    'settings-status-chip-error': server.status === 'error' || server.status === 'exited' || server.status === 'completed'
+                                  }"
+                                >
+                                  {{ server.status }}
+                                </span>
+                                <span class="text-xs text-[var(--text-subtle)]">{{ server.toolCount }} 工具</span>
+                              </div>
+                              <p class="mt-0.5 text-xs text-[var(--text-subtle)] font-mono">{{ server.command }} {{ server.args?.join(' ') }}</p>
+                              <p v-if="server.error" class="mt-1 text-xs text-red-500">{{ server.error }}</p>
+                            </div>
+                            <div class="flex items-center gap-1">
+                              <button
+                                type="button"
+                                class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]"
+                                title="查看日志"
+                                @click="showMcpLogs(server.serverId)"
+                              >
+                                <FileText class="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-[var(--surface-soft)] hover:text-[var(--text)]"
+                                title="编辑配置"
+                                @click="openMcpEditDialog(server)"
+                              >
+                                <Pencil class="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                class="motion-icon rounded-md p-1.5 text-[var(--text-subtle)] hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                                title="断开连接"
+                                @click="disconnectMcpServer(server.serverId)"
+                              >
+                                <Trash2 class="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                          <div v-if="server.tools?.length" class="mt-3 flex flex-wrap gap-1.5">
+                            <span
+                              v-for="tool in server.tools"
+                              :key="tool.name"
+                              class="inline-flex items-center rounded-full bg-[var(--surface-soft)] px-2 py-0.5 text-[11px] text-[var(--text-muted)]"
+                            >
+                              {{ tool.name }}
+                            </span>
+                          </div>
+                        </div>
+                        <div v-if="!mcpServers.length" class="py-8 text-center text-sm text-[var(--text-subtle)]">
+                          尚未连接任何 MCP Server。点击"添加 Server"开始配置。
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- 导入配置 -->
+                    <div class="rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] p-4 shadow-sm">
+                      <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h4 class="text-sm font-semibold text-[var(--text)]">导入配置</h4>
+                          <p class="mt-1 text-xs leading-6 text-[var(--text-subtle)]">
+                            粘贴 MCP JSON 配置或 server URL，一键批量导入。
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          class="motion-surface flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] px-3 text-xs text-[var(--text-muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]"
+                          @click="showMcpImportDialog = true"
+                        >
+                          <Download class="h-3.5 w-3.5" />
+                          导入配置
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div v-else key="debug" class="flex h-full flex-col p-6">
                 <div class="mb-4 flex items-center justify-between">
                   <h4 class="text-sm font-semibold text-[var(--text)]">结构化调试日志</h4>
@@ -5062,6 +5895,194 @@ onBeforeUnmount(() => {
           </div>
           <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
             <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="closeSkillDetailDialog">关闭</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- Memory Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showMemoryDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="closeMemoryDialog">
+        <div class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">{{ memoryDialogMode === 'create' ? '新建记忆块' : '编辑记忆块' }}</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="closeMemoryDialog">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="space-y-4 p-5">
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">标签</label>
+              <input v-model.trim="memoryForm.label" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="唯一的标识名称" :disabled="memoryDialogMode === 'edit'" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">描述</label>
+              <input v-model.trim="memoryForm.description" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="简要描述这个记忆块的用途" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">内容</label>
+              <textarea v-model="memoryForm.value" rows="8" class="motion-field custom-scrollbar w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-3 text-sm font-mono leading-6 text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="记忆内容..."></textarea>
+            </div>
+            <div class="flex items-center gap-4">
+              <div class="flex items-center gap-2">
+                <label class="text-sm font-medium text-[var(--text-muted)]">字符上限</label>
+                <input v-model.number="memoryForm.chars_limit" type="number" min="100" max="100000" class="motion-field h-9 w-24 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" />
+              </div>
+              <div class="flex items-center gap-2">
+                <input v-model="memoryForm.read_only" type="checkbox" id="memoryReadOnly" class="h-4 w-4 rounded border-[var(--border)]" />
+                <label for="memoryReadOnly" class="text-sm font-medium text-[var(--text-muted)]">只读</label>
+              </div>
+            </div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="closeMemoryDialog">取消</button>
+            <button type="button" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)]" @click="submitMemoryForm">
+              <Check class="h-4 w-4" />
+              保存
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- MCP Add Server Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showMcpAddDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="showMcpAddDialog = false">
+        <div class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">添加 MCP Server</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="showMcpAddDialog = false">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="space-y-4 p-5">
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">名称（可选）</label>
+              <input v-model.trim="mcpAddForm.name" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="例如：filesystem-server" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">命令</label>
+              <input v-model.trim="mcpAddForm.command" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="例如：npx 或 /path/to/server" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">参数（可选，空格分隔）</label>
+              <input v-model.trim="mcpAddForm.args" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="例如：-p 3000 --verbose" />
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">工作目录（可选）</label>
+              <input v-model.trim="mcpAddForm.cwd" type="text" class="motion-field h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 text-sm font-mono text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder="默认使用当前工作目录" />
+            </div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="showMcpAddDialog = false">取消</button>
+            <button type="button" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)]" :disabled="!mcpAddForm.command.trim() || isConnectingMcp" @click="addMcpServer">
+              <Check class="h-4 w-4" />
+              连接
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- MCP Import Config Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showMcpImportDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="showMcpImportDialog = false">
+        <div class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">导入 MCP 配置</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="showMcpImportDialog = false">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="space-y-4 p-5">
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">粘贴 MCP 配置 JSON</label>
+              <textarea v-model="mcpImportText" rows="10" class="motion-field custom-scrollbar w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-3 text-sm font-mono leading-6 text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder='{"mcpServers": {"Name": {"command": "npx", "args": ["-y", "@xxx/server"]}}}&#10;&#10;或直接粘贴 URL：&#10;https://your-mcp-server.com/sse'></textarea>
+            </div>
+            <div v-if="mcpImportError" class="text-xs text-red-500">{{ mcpImportError }}</div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="showMcpImportDialog = false">取消</button>
+            <button type="button" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)]" :disabled="!mcpImportText.trim() || isImportingMcp" @click="importMcpConfig">
+              <Check class="h-4 w-4" />
+              导入
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- MCP Log Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showMcpLogDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="showMcpLogDialog = false">
+        <div class="w-full max-w-2xl rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">MCP 日志 - {{ mcpLogData?.name }}</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="showMcpLogDialog = false">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="p-5">
+            <div class="mb-3 flex items-center gap-2">
+              <span class="text-xs text-[var(--text-muted)]">状态:</span>
+              <span
+                class="settings-status-chip"
+                :class="{
+                  'settings-status-chip-success': mcpLogData?.status === 'initialized' || mcpLogData?.status === 'connecting',
+                  'settings-status-chip-error': mcpLogData?.status === 'error' || mcpLogData?.status === 'exited'
+                }"
+              >
+                {{ mcpLogData?.status }}
+              </span>
+            </div>
+            <div v-if="mcpLogData?.error" class="mb-3 rounded-lg bg-red-500/10 p-3 text-xs text-red-500">
+              {{ mcpLogData.error }}
+            </div>
+            <div class="custom-scrollbar max-h-[400px] overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-3">
+              <div v-if="mcpLogData?.logs?.length">
+                <div
+                  v-for="(log, i) in mcpLogData.logs"
+                  :key="i"
+                  class="mb-2 font-mono text-xs"
+                >
+                  <span class="text-[var(--text-subtle)]">[{{ new Date(log.ts).toLocaleTimeString() }}]</span>
+                  <span :class="log.channel === 'stderr' ? 'text-yellow-500' : 'text-[var(--text-muted)]'">{{ log.channel }}</span>
+                  <span class="ml-2 whitespace-pre-wrap break-all text-[var(--text)]">{{ log.text }}</span>
+                </div>
+              </div>
+              <div v-else class="text-center text-sm text-[var(--text-subtle)]">暂无日志</div>
+            </div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="showMcpLogDialog = false">关闭</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- MCP Edit Server Dialog -->
+    <Transition name="overlay-fade">
+      <div v-if="showMcpEditDialog" class="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4" @click.self="showMcpEditDialog = false">
+        <div class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--app-bg)] shadow-xl">
+          <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-4">
+            <h3 class="text-base font-semibold text-[var(--text)]">编辑 MCP Server (JSON)</h3>
+            <button type="button" class="motion-icon rounded-md p-1 text-[var(--text-subtle)] hover:text-[var(--text)]" @click="showMcpEditDialog = false">
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <div class="space-y-4 p-5">
+            <div>
+              <label class="block text-sm font-medium text-[var(--text-muted)] mb-1.5">mcpServers 配置</label>
+              <textarea v-model="mcpEditJson" rows="12" class="motion-field custom-scrollbar w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-3 text-sm font-mono leading-6 text-[var(--text)] focus:bg-[var(--app-bg)] focus:border-[var(--border-strong)] focus:outline-none focus:ring-4 focus:ring-[var(--ring)]" placeholder='{"mcpServers": {"Name": {"command": "npx", "args": ["-y", "@xxx/server"]}}}'></textarea>
+            </div>
+            <div v-if="mcpEditJsonError" class="text-xs text-red-500">{{ mcpEditJsonError }}</div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-[var(--border)] px-5 py-4">
+            <button type="button" class="motion-list-item rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--surface-soft)]/50 hover:text-[var(--text)]" @click="showMcpEditDialog = false">取消</button>
+            <button type="button" class="motion-surface flex items-center gap-2 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--shell-bg)] shadow-sm hover:bg-[var(--accent-strong)]" :disabled="!mcpEditJson.trim() || isConnectingMcp" @click="updateMcpServer">
+              <Check class="h-4 w-4" />
+              保存并更新
+            </button>
           </div>
         </div>
       </div>

@@ -31,6 +31,7 @@ export const defaultAppSettings: AppSettings = {
   workspaceRoot: '',
   launchAutoSend: false,
   darkMode: 'auto',
+  enableBashNotification: false,
 }
 
 export const clampToolRoundLimit = (value: unknown) => {
@@ -95,6 +96,7 @@ export const normalizeAppSettings = (value: unknown): AppSettings => {
     workspaceRoot: String(current.workspaceRoot ?? '').trim(),
     launchAutoSend: current.launchAutoSend === true,
     darkMode: (current.darkMode === 'light' || current.darkMode === 'dark') ? current.darkMode : 'auto',
+    enableBashNotification: Boolean(current.enableBashNotification),
   }
 }
 
@@ -121,7 +123,15 @@ export const createDefaultProviders = (): Provider[] => [
     type: 'anthropic',
     baseURL: 'https://api.anthropic.com',
     apiKey: '',
-    models: ['claude-3-5-haiku-20241017', 'claude-3-5-sonnet-20241022', 'claude-3-opus-20240229'],
+    // Claude 4 models (latest) + legacy Claude 3.5/3 models
+    models: [
+      'claude-opus-4-7',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5-20251001',
+      'claude-3-5-sonnet-20241022',
+      'claude-3-5-haiku-20241017',
+      'claude-3-opus-20240229',
+    ],
   },
 ]
 

@@ -3,15 +3,19 @@ const os = require('node:os');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 const { exec, spawn } = require('node:child_process');
+const http = require('http');
+const https = require('https');
 const OpenAIImport = require('openai');
 const { tavily } = require('@tavily/core');
-const { AnthropicProvider } = require('@ai-sdk/anthropic');
+const { Anthropic } = require('@ai-sdk/anthropic');
 let AdmZip = null;
 try { AdmZip = require('adm-zip'); } catch (_) { /* not available */ }
 
 const OpenAIClient = OpenAIImport?.OpenAI || OpenAIImport;
 const MAX_DEBUG_LOGS = 800;
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n/;
+const MEMORY_STORAGE_KEY = 'kuke_memory_blocks';
+const DEFAULT_MEMORY_LIMIT = 5000;
 
 // Default workspace: plugin-owned folder under user home to avoid polluting project directories
 // Falls back to os.tmpdir() if home is unavailable
@@ -42,6 +46,895 @@ const debugLogs = [];
 const activeChatControllers = new Map();
 const activeBashProcesses = new Map();
 let bashIdSeq = 0;
+
+// MCP Server Management
+const activeMcpServers = new Map();
+let mcpServerIdSeq = 0;
+let mcpRequestIdSeq = 0;
+
+function createMcpJsonRpcMessage(method, params = {}) {
+  return {
+    jsonrpc: '2.0',
+    id: ++mcpRequestIdSeq,
+    method,
+    params,
+  };
+}
+
+function parseMcpResponse(line) {
+  try {
+    const obj = JSON.parse(line);
+    return obj;
+  } catch {
+    return null;
+  }
+}
+
+function sendMcpRequest(serverRecord, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const message = createMcpJsonRpcMessage(method, params);
+    const requestId = message.id;
+    const timeout = setTimeout(() => {
+      serverRecord.pendingRequests.delete(requestId);
+      reject(new Error(`MCP request ${method} timed out`));
+    }, 60000);
+    serverRecord.pendingRequests.set(requestId, { timeout, resolve, reject });
+    serverRecord.proc.stdin.write(JSON.stringify(message) + '\n');
+  });
+}
+
+function connectMcpServer(options) {
+  options = options || {};
+  const command = String(options.command != null ? options.command : '').trim();
+  const args = Array.isArray(options.args) ? options.args : [];
+  const env = typeof options.env === 'object' && options.env !== null ? options.env : {};
+  const cmdParts = command.split('/');
+  const name = String(options.name != null ? options.name : (cmdParts.length > 0 ? cmdParts[cmdParts.length - 1] : 'MCP Server')).trim();
+  const cwd = typeof options.cwd === 'string' ? options.cwd.trim() : process.cwd();
+
+  if (!command) {
+    return { success: false, error: 'command 不能为空' };
+  }
+
+  const serverId = `mcp_${++mcpServerIdSeq}`;
+  const startAt = Date.now();
+
+  let proc;
+  try {
+    proc = spawn(command, args, {
+      cwd,
+      env: { ...process.env, ...env },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    return { success: false, error: `启动 MCP Server 失败: ${safeErrorMessage(error)}` };
+  }
+
+  const record = {
+    serverId,
+    name,
+    command,
+    args,
+    cwd,
+    proc,
+    status: 'connecting',
+    tools: [],
+    pendingRequests: new Map(),
+    output: [],
+    cursor: 0,
+    startedAt: startAt,
+    endedAt: null,
+    exitCode: null,
+    error: null,
+  };
+
+  activeMcpServers.set(serverId, record);
+
+  proc.stdout?.setEncoding('utf-8');
+  proc.stderr?.setEncoding('utf-8');
+
+  let buffer = '';
+  proc.stdout?.on('data', (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const response = parseMcpResponse(line);
+      if (response && response.id !== undefined) {
+        const pending = record.pendingRequests.get(response.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          record.pendingRequests.delete(response.id);
+          if (response.error) {
+            pending.reject(new Error(response.error.message || JSON.stringify(response.error)));
+          } else {
+            pending.resolve(response.result);
+          }
+        }
+      }
+    }
+  });
+
+  proc.stderr?.on('data', (chunk) => {
+    const text = String(chunk).slice(0, 4096);
+    record.output.push({ channel: 'stderr', text, ts: Date.now() });
+    appendDebugLog('mcp', 'stderr', { serverId, text }, 'warn');
+  });
+
+  proc.on('error', (error) => {
+    record.status = 'error';
+    record.error = safeErrorMessage(error);
+    record.endedAt = Date.now();
+    for (const [id, pending] of record.pendingRequests) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(`MCP Server 异常: ${safeErrorMessage(error)}`));
+    }
+    record.pendingRequests.clear();
+    appendDebugLog('mcp', 'error', { serverId, error: safeErrorMessage(error) }, 'error');
+  });
+
+  proc.on('close', (code, signal) => {
+    record.status = code === 0 ? 'completed' : 'exited';
+    record.exitCode = code;
+    record.endedAt = Date.now();
+    for (const [id, pending] of record.pendingRequests) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(`MCP Server 已关闭`));
+    }
+    record.pendingRequests.clear();
+    appendDebugLog('mcp', 'closed', { serverId, code, signal, durationMs: record.endedAt - record.startedAt });
+  });
+
+  appendDebugLog('mcp', 'started', { serverId, name, command, args, cwd });
+
+  return { success: true, data: { serverId, name, status: 'connecting', command, args, cwd } };
+}
+
+async function initializeMcpServer(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  try {
+    const result = await sendMcpRequest(record, 'initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      clientInfo: { name: 'kuke-agent', version: '1.0.0' },
+    });
+    record.status = 'initialized';
+    appendDebugLog('mcp', 'initialized', { serverId, result });
+    return { success: true, data: result };
+  } catch (error) {
+    record.status = 'error';
+    record.error = safeErrorMessage(error);
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+async function listMcpTools(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  try {
+    const result = await sendMcpRequest(record, 'tools/list', {});
+    const tools = result?.tools || [];
+    record.tools = tools.map(t => ({
+      name: t.name,
+      description: t.description || '',
+      inputSchema: t.inputSchema || { type: 'object', properties: {} },
+    }));
+    appendDebugLog('mcp', 'tools_listed', { serverId, count: tools.length });
+    return { success: true, data: record.tools };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function connectMcpHttpServer(options) {
+  options = options || {};
+  const urlStr = String(options.url != null ? options.url : '').trim();
+  const name = String(options.name != null ? options.name : 'HTTP MCP Server').trim();
+  const headers = typeof options.headers === 'object' && options.headers !== null ? options.headers : {};
+  const transport = options.transport === 'sse' ? 'sse' : 'http';
+
+  if (!urlStr) {
+    return { success: false, error: 'url 不能为空' };
+  }
+
+  let url;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    return { success: false, error: '无效的 URL 格式' };
+  }
+
+  const serverId = `mcp_${++mcpServerIdSeq}`;
+  const startAt = Date.now();
+
+  const record = {
+    serverId,
+    name,
+    command: urlStr,
+    args: [],
+    cwd: '',
+    proc: null,
+    status: 'connecting',
+    tools: [],
+    pendingRequests: new Map(),
+    output: [],
+    cursor: 0,
+    startedAt: startAt,
+    endedAt: null,
+    exitCode: null,
+    error: null,
+    isHttp: true,
+    isSse: transport === 'sse',
+    baseUrl: url,
+    extraHeaders: headers,
+    eventSource: null,
+    httpAgent: url.protocol === 'https:' ? https.globalAgent : http.globalAgent,
+    sseEndpoint: null,
+    sseConnected: false,
+  };
+
+  activeMcpServers.set(serverId, record);
+
+  appendDebugLog('mcp', 'http_started', { serverId, name, url: urlStr, transport });
+
+  return { success: true, data: { serverId, name, status: 'connecting', url: urlStr, transport } };
+}
+
+function httpRequest(record, method, body) {
+  return new Promise((resolve, reject) => {
+    const url = record.baseUrl;
+    const bodyStr = body ? JSON.stringify(body) : '';
+    const headers = {
+      ...record.extraHeaders,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(bodyStr),
+    };
+
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method,
+      headers,
+      agent: record.httpAgent,
+    };
+
+    const req = (url.protocol === 'https:' ? https : http).request(opts, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, headers: res.headers, body: data });
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(60000, () => {
+      req.destroy();
+      reject(new Error('HTTP 请求超时'));
+    });
+
+    if (bodyStr) {
+      req.write(bodyStr);
+    }
+    req.end();
+  });
+}
+
+function sseRequest(record, body) {
+  record.output.push({ channel: 'stdout', text: `[DEBUG] sseRequest 开始, method: ${body.method}`, ts: Date.now() });
+  return new Promise((resolve, reject) => {
+    if (!record.sseEndpoint || !record.sseConnected) {
+      record.output.push({ channel: 'stderr', text: `[DEBUG] sseRequest: SSE 未连接`, ts: Date.now() });
+      reject(new Error('SSE endpoint未建立'));
+      return;
+    }
+
+    const requestId = ++mcpRequestIdSeq;
+    const request = {
+      jsonrpc: '2.0',
+      id: requestId,
+      ...body,
+    };
+
+    record.pendingRequests.set(requestId, { resolve, reject, method: body.method });
+    record.output.push({ channel: 'stdout', text: `[DEBUG] sseRequest 请求 #${requestId}, method: ${body.method}`, ts: Date.now() });
+
+    const baseUrl = record.baseUrl?.origin || 'https://api.kuke.ink';
+    const url = new URL(record.sseEndpoint, baseUrl);
+    const bodyStr = JSON.stringify(request);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(bodyStr),
+      ...record.extraHeaders,
+    };
+
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers,
+    };
+
+    const req = (url.protocol === 'https:' ? https : http).request(opts, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 202 || res.statusCode === 200) {
+          record.output.push({ channel: 'stdout', text: `[DEBUG] sseRequest POST 响应: ${res.statusCode}, 等待SSE流响应`, ts: Date.now() });
+        } else {
+          record.pendingRequests.delete(requestId);
+          record.output.push({ channel: 'stderr', text: `[DEBUG] sseRequest HTTP错误: ${res.statusCode} ${data}`, ts: Date.now() });
+          reject(new Error(`HTTP ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      record.pendingRequests.delete(requestId);
+      record.output.push({ channel: 'stderr', text: `[DEBUG] sseRequest POST错误: ${err.message}`, ts: Date.now() });
+      reject(err);
+    });
+
+    req.setTimeout(30000, () => {
+      req.destroy();
+      if (record.pendingRequests.has(requestId)) {
+        record.pendingRequests.delete(requestId);
+        record.output.push({ channel: 'stderr', text: `[DEBUG] sseRequest 超时`, ts: Date.now() });
+        reject(new Error('SSE请求超时'));
+      }
+    });
+
+    req.write(bodyStr);
+    req.end();
+
+    setTimeout(() => {
+      if (record.pendingRequests.has(requestId)) {
+        record.pendingRequests.delete(requestId);
+        record.output.push({ channel: 'stderr', text: `[DEBUG] sseRequest 30秒超时未收到响应`, ts: Date.now() });
+        reject(new Error('SSE请求超时，未收到响应'));
+      }
+    }, 30000);
+  });
+}
+
+async function initializeMcpSseServer(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record || !record.isHttp) {
+    return { success: false, error: `MCP HTTP Server 不存在: ${serverId}` };
+  }
+
+  record.pendingRequests = new Map();
+  record.status = 'connecting';
+  record.tools = [];
+
+  return new Promise((resolve, reject) => {
+    const url = record.baseUrl;
+    const headers = {
+      ...record.extraHeaders,
+      'Accept': 'text/event-stream',
+    };
+
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers,
+      agent: record.httpAgent,
+    };
+
+    record.output.push({ channel: 'stdout', text: `[MCP-SSE] 连接 ${url.protocol}//${url.host}${opts.path}`, ts: Date.now() });
+
+    const req = (url.protocol === 'https:' ? https : http).request(opts, (res) => {
+      let buffer = '';
+
+      record.output.push({ channel: 'stdout', text: `[MCP-SSE] 状态码: ${res.statusCode}`, ts: Date.now() });
+
+      if (res.statusCode !== 200) {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          record.status = 'error';
+          record.error = `HTTP ${res.statusCode}`;
+          record.output.push({ channel: 'stderr', text: `[MCP-SSE] HTTP错误: ${body}`, ts: Date.now() });
+          reject(new Error(record.error));
+        });
+        return;
+      }
+
+      res.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+
+            if (data === '[DONE]') {
+              record.output.push({ channel: 'stdout', text: `[MCP-SSE] 连接结束`, ts: Date.now() });
+              continue;
+            }
+
+            if (data.startsWith('/')) {
+              record.sseEndpoint = data;
+              record.sseConnected = true;
+              record.output.push({ channel: 'stdout', text: `[MCP-SSE] endpoint: ${data}`, ts: Date.now() });
+              resolve(data);
+              continue;
+            }
+
+            try {
+              const json = JSON.parse(data);
+              record.output.push({ channel: 'stdout', text: `[MCP-SSE] 收到: ${JSON.stringify(json).substring(0, 80)}`, ts: Date.now() });
+
+              if (json.id !== undefined && record.pendingRequests && record.pendingRequests.has(json.id)) {
+                const pending = record.pendingRequests.get(json.id);
+                record.pendingRequests.delete(json.id);
+                record.output.push({ channel: 'stdout', text: `[MCP-SSE] 响应 #${json.id} method=${pending.method || 'unknown'}`, ts: Date.now() });
+
+                if (json.error) {
+                  record.status = 'error';
+                  record.error = json.error.message || JSON.stringify(json.error);
+                  if (pending.reject) pending.reject(new Error(record.error));
+                } else {
+                  if (pending.resolve) {
+                    pending.resolve(json.result || json);
+                  }
+                }
+              }
+            } catch (e) {
+              record.output.push({ channel: 'stderr', text: `[MCP-SSE] 解析错误: ${data.substring(0, 50)}`, ts: Date.now() });
+            }
+          }
+        }
+      });
+
+      res.on('end', () => {
+        record.sseConnected = false;
+        record.output.push({ channel: 'stderr', text: `[MCP-SSE] 连接意外关闭`, ts: Date.now() });
+      });
+
+      res.on('error', (err) => {
+        record.output.push({ channel: 'stderr', text: `[MCP-SSE] SSE错误: ${err.message}`, ts: Date.now() });
+      });
+    });
+
+    req.on('error', (err) => {
+      record.status = 'error';
+      record.error = `连接失败: ${err.message}`;
+      record.output.push({ channel: 'stderr', text: `[MCP-SSE] 连接错误: ${err.message}`, ts: Date.now() });
+      reject(new Error(record.error));
+    });
+
+    req.setTimeout(30000, () => {
+      req.destroy();
+      record.status = 'error';
+      record.error = '连接超时';
+      record.output.push({ channel: 'stderr', text: `[MCP-SSE] 连接超时`, ts: Date.now() });
+      reject(new Error('连接超时'));
+    });
+
+    req.end();
+  }).then(async (endpoint) => {
+    record.output.push({ channel: 'stdout', text: `[MCP-SSE] 发送 initialize...`, ts: Date.now() });
+
+    const initResult = await mcpSseRequest(record, 'initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      clientInfo: { name: 'kuke-agent', version: '1.0.0' },
+    });
+
+    record.status = 'initialized';
+    record.output.push({ channel: 'stdout', text: `[MCP-SSE] initialize成功`, ts: Date.now() });
+
+    const toolsResult = await mcpSseRequest(record, 'tools/list', {});
+    const tools = toolsResult?.tools || [];
+    record.tools = tools.map(t => ({
+      name: t.name,
+      description: t.description || '',
+      inputSchema: t.inputSchema || { type: 'object', properties: {} },
+    }));
+    record.status = 'initialized';
+    record.output.push({ channel: 'stdout', text: `[MCP-SSE] 工具: ${record.tools.map(t => t.name).join(', ')}`, ts: Date.now() });
+
+    return { success: true, data: record.tools };
+  }).catch((err) => {
+    record.status = 'error';
+    record.error = err.message;
+    return { success: false, error: err.message };
+  });
+}
+
+function mcpSseRequest(record, method, params) {
+  return new Promise((resolve, reject) => {
+    if (!record.sseEndpoint || !record.sseConnected) {
+      reject(new Error('SSE未连接'));
+      return;
+    }
+
+    const requestId = ++mcpRequestIdSeq;
+    const request = {
+      jsonrpc: '2.0',
+      id: requestId,
+      method,
+      params: params || {},
+    };
+
+    record.pendingRequests.set(requestId, { resolve, reject, method });
+    record.output.push({ channel: 'stdout', text: `[MCP-SSE] 发送 #${requestId} ${method}`, ts: Date.now() });
+
+    const url = new URL(record.sseEndpoint, 'https://api.kuke.ink');
+    const bodyStr = JSON.stringify(request);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(bodyStr),
+      ...record.extraHeaders,
+    };
+
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers,
+    };
+
+    const postReq = (url.protocol === 'https:' ? https : http).request(opts, (res) => {
+      record.output.push({ channel: 'stdout', text: `[MCP-SSE] POST #${requestId} 响应: ${res.statusCode}`, ts: Date.now() });
+    });
+
+    postReq.on('error', (err) => {
+      record.pendingRequests.delete(requestId);
+      record.output.push({ channel: 'stderr', text: `[MCP-SSE] POST #${requestId} 错误: ${err.message}`, ts: Date.now() });
+      reject(err);
+    });
+
+    postReq.setTimeout(30000, () => {
+      postReq.destroy();
+      if (record.pendingRequests.has(requestId)) {
+        record.pendingRequests.delete(requestId);
+        reject(new Error('请求超时'));
+      }
+    });
+
+    postReq.write(bodyStr);
+    postReq.end();
+
+    setTimeout(() => {
+      if (record.pendingRequests.has(requestId)) {
+        record.pendingRequests.delete(requestId);
+        record.output.push({ channel: 'stderr', text: `[MCP-SSE] #${requestId} 30秒超时`, ts: Date.now() });
+        reject(new Error('请求超时（30秒）'));
+      }
+    }, 30000);
+  });
+}
+
+async function initializeMcpHttpServer(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record || !record.isHttp) {
+    return { success: false, error: `MCP HTTP Server 不存在: ${serverId}` };
+  }
+
+  if (record.isSse) {
+    return initializeMcpSseServer(serverId);
+  }
+
+  try {
+    const result = await httpRequest(record, 'POST', {
+      jsonrpc: '2.0',
+      id: ++mcpRequestIdSeq,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        clientInfo: { name: 'kuke-agent', version: '1.0.0' },
+      },
+    });
+
+    if (result.status !== 200) {
+      record.status = 'error';
+      record.error = `HTTP ${result.status}`;
+      record.output.push({ channel: 'stderr', text: `初始化失败: HTTP ${result.status}\n响应内容: ${result.body || '(空)'}`, ts: Date.now() });
+      appendDebugLog('mcp', 'http_error', { serverId, status: result.status, body: result.body });
+      return { success: false, error: `初始化失败: HTTP ${result.status}\n响应: ${result.body || '(空)'}` };
+    }
+
+    record.status = 'initialized';
+    appendDebugLog('mcp', 'initialized', { serverId, result });
+    return { success: true, data: result };
+  } catch (error) {
+    record.status = 'error';
+    record.error = safeErrorMessage(error);
+    record.output.push({ channel: 'stderr', text: `初始化异常: ${safeErrorMessage(error)}`, ts: Date.now() });
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function initializeMcpSseServerAsync(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (record) {
+    record.output.push({ channel: 'stdout', text: `[DEBUG] initializeMcpSseServerAsync 开始`, ts: Date.now() });
+  }
+  initializeMcpSseServer(serverId).then((result) => {
+    if (record) {
+      record.output.push({ channel: 'stdout', text: `[DEBUG] initializeMcpSseServer 完成, result.success=${result?.success}`, ts: Date.now() });
+    }
+    if (result?.success) {
+      if (record) {
+        record.output.push({ channel: 'stdout', text: `[DEBUG] 初始化成功，获取工具列表`, ts: Date.now() });
+      }
+      listMcpHttpTools(serverId);
+    } else {
+      if (record) {
+        record.output.push({ channel: 'stderr', text: `[DEBUG] initializeMcpSseServer 失败: ${JSON.stringify(result)}`, ts: Date.now() });
+      }
+    }
+  }).catch((err) => {
+    if (record) {
+      record.output.push({ channel: 'stderr', text: `[DEBUG] MCP SSE 初始化异常: ${err.message}`, ts: Date.now() });
+    }
+  });
+}
+
+function initializeMcpHttpServerAsync(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record || !record.isHttp) return;
+  if (record.isSse) {
+    initializeMcpSseServerAsync(serverId);
+  } else {
+    initializeMcpHttpServer(serverId).then(() => {
+      listMcpHttpTools(serverId);
+    });
+  }
+}
+
+function initializeMcpServerAsync(serverId) {
+  initializeMcpServer(serverId).then(() => {
+    listMcpTools(serverId);
+  });
+}
+
+async function listMcpHttpTools(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (record) {
+    record.output.push({ channel: 'stdout', text: `[DEBUG] listMcpHttpTools 开始, serverId: ${serverId}, isSse: ${record.isSse}, sseConnected: ${record.sseConnected}`, ts: Date.now() });
+  }
+  if (!record || !record.isHttp) {
+    if (record) {
+      record.output.push({ channel: 'stderr', text: `[DEBUG] listMcpHttpTools: record 不存在或不是 HTTP`, ts: Date.now() });
+    }
+    return { success: false, error: `MCP HTTP Server 不存在: ${serverId}` };
+  }
+
+  try {
+    // 如果 SSE 已初始化且工具有缓存，直接返回（避免重复请求）
+    if (record.isSse && record.tools && record.tools.length > 0) {
+      record.output.push({ channel: 'stdout', text: `[DEBUG] listMcpHttpTools: 使用缓存的 ${record.tools.length} 个工具`, ts: Date.now() });
+      return { success: true, data: record.tools };
+    }
+
+    let result;
+    if (record.isSse) {
+      if (!record.sseConnected) {
+        return { success: false, error: 'SSE未连接，请先初始化' };
+      }
+      result = await mcpSseRequest(record, 'tools/list', {});
+    } else {
+      result = await httpRequest(record, 'POST', {
+        jsonrpc: '2.0',
+        id: ++mcpRequestIdSeq,
+        method: 'tools/list',
+        params: {},
+      });
+    }
+
+    let tools = [];
+    if (result) {
+      const data = result.result || result;
+      tools = data?.tools || [];
+    }
+
+    record.tools = tools.map(t => ({
+      name: t.name,
+      description: t.description || '',
+      inputSchema: t.inputSchema || { type: 'object', properties: {} },
+    }));
+    appendDebugLog('mcp', 'tools_listed', { serverId, count: tools.length });
+    return { success: true, data: record.tools };
+  } catch (error) {
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+async function callMcpHttpTool(serverId, toolName, arguments_) {
+  const record = activeMcpServers.get(serverId);
+  if (!record || !record.isHttp) {
+    return { success: false, error: `MCP HTTP Server 不存在: ${serverId}` };
+  }
+
+  try {
+    let result;
+    if (record.isSse) {
+      if (!record.sseConnected) {
+        return { success: false, error: 'SSE未连接，请先初始化' };
+      }
+      result = await mcpSseRequest(record, 'tools/call', {
+        name: toolName,
+        arguments: arguments_ || {},
+      });
+    } else {
+      result = await httpRequest(record, 'POST', {
+        jsonrpc: '2.0',
+        id: ++mcpRequestIdSeq,
+        method: 'tools/call',
+        params: {
+          name: toolName,
+          arguments: arguments_ || {},
+        },
+      });
+
+      if (result.status !== 200 && result.status !== 201) {
+        return { success: false, error: `HTTP ${result.status}` };
+      }
+
+      try {
+        const parsed = JSON.parse(result.body);
+        if (parsed.error) {
+          return { success: false, error: parsed.error.message || JSON.stringify(parsed.error) };
+        }
+        result = parsed.result || parsed;
+      } catch { /* keep raw */ }
+    }
+
+    appendDebugLog('mcp', 'tool_called', { serverId, toolName, success: true });
+    return { success: true, data: result };
+  } catch (error) {
+    appendDebugLog('mcp', 'tool_called', { serverId, toolName, success: false, error: safeErrorMessage(error) }, 'error');
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+async function callMcpTool(serverId, toolName, arguments_) {
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  if (record.isHttp) {
+    return callMcpHttpTool(serverId, toolName, arguments_);
+  }
+
+  try {
+    const result = await sendMcpRequest(record, 'tools/call', {
+      name: toolName,
+      arguments: arguments_ || {},
+    });
+    appendDebugLog('mcp', 'tool_called', { serverId, toolName, success: true });
+    return { success: true, data: result };
+  } catch (error) {
+    appendDebugLog('mcp', 'tool_called', { serverId, toolName, success: false, error: safeErrorMessage(error) }, 'error');
+    return { success: false, error: safeErrorMessage(error) };
+  }
+}
+
+function disconnectMcpServer(serverId) {
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  if (record.isHttp) {
+    record.status = 'exited';
+    record.endedAt = Date.now();
+    record.eventSource = null;
+  } else if (record.status === 'running' || record.status === 'connecting' || record.status === 'initialized') {
+    try {
+      record.proc.kill('SIGTERM');
+    } catch { /* best effort */ }
+    setTimeout(() => {
+      if (record.status !== 'completed' && record.status !== 'exited') {
+        try {
+          record.proc.kill('SIGKILL');
+        } catch { /* best effort */ }
+      }
+    }, 1000);
+  }
+
+  for (const [id, pending] of record.pendingRequests) {
+    clearTimeout(pending.timeout);
+    pending.reject(new Error('MCP Server 正在断开'));
+  }
+  record.pendingRequests.clear();
+  activeMcpServers.delete(serverId);
+  appendDebugLog('mcp', 'disconnected', { serverId });
+  return { success: true, data: { serverId } };
+}
+
+function listMcpServers() {
+  const items = [];
+  for (const [serverId, record] of activeMcpServers.entries()) {
+    items.push({
+      serverId,
+      name: record.name,
+      command: record.command,
+      args: record.args,
+      cwd: record.cwd,
+      status: record.status,
+      toolCount: record.tools.length,
+      tools: record.tools,
+      startedAt: record.startedAt,
+      endedAt: record.endedAt,
+      exitCode: record.exitCode,
+      error: record.error,
+      extraHeaders: record.extraHeaders,
+      transport: record.isSse ? 'sse' : undefined,
+      env: record.env,
+    });
+  }
+  return { success: true, data: items };
+}
+
+function readMcpServerOutput(options = {}) {
+  const serverId = String(options?.serverId || '').trim();
+  if (!serverId) {
+    return { success: false, error: 'serverId 不能为空' };
+  }
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  const newChunks = record.output.slice(record.cursor);
+  record.cursor = record.output.length;
+
+  return {
+    success: true,
+    data: {
+      serverId,
+      status: record.status,
+      newChunks: newChunks.length,
+      logs: newChunks.map(c => ({ channel: c.channel, text: c.text, ts: c.ts })),
+    },
+  };
+}
+
+function getMcpServerLogs(options = {}) {
+  const serverId = String(options?.serverId || '').trim();
+  if (!serverId) {
+    return { success: false, error: 'serverId 不能为空' };
+  }
+  const record = activeMcpServers.get(serverId);
+  if (!record) {
+    return { success: false, error: `MCP Server 不存在: ${serverId}` };
+  }
+
+  return {
+    success: true,
+    data: {
+      serverId,
+      name: record.name,
+      status: record.status,
+      error: record.error,
+      logs: record.output.map(c => ({ channel: c.channel, text: c.text, ts: c.ts })),
+    },
+  };
+}
 const BASH_OUTPUT_BUFFER_CAP = 8 * 1024 * 1024;
 const BASH_DEFAULT_TIMEOUT_MS = 120 * 1000;
 const BASH_MAX_TIMEOUT_MS = 10 * 60 * 1000;
@@ -146,6 +1039,135 @@ function deleteSkill(entry) {
   } catch (error) {
     return { success: false, error: safeErrorMessage(error) };
   }
+}
+
+function loadMemoryBlocks() {
+  try {
+    const raw = localStorage.getItem(MEMORY_STORAGE_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+function saveMemoryBlocks(blocks) {
+  localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(blocks));
+}
+
+function listMemoryBlocks() {
+  const blocks = loadMemoryBlocks();
+  const now = Date.now();
+  return {
+    success: true,
+    data: Object.entries(blocks).map(([label, block]) => ({
+      label,
+      description: block.description || '',
+      value: block.value || '',
+      chars_current: (block.value || '').length,
+      chars_limit: block.chars_limit || DEFAULT_MEMORY_LIMIT,
+      read_only: Boolean(block.read_only),
+      updatedAt: block.updatedAt || now,
+    })),
+  };
+}
+
+function getMemoryBlock(label) {
+  const blocks = loadMemoryBlocks();
+  const block = blocks[label];
+  if (!block) return { success: false, error: `记忆块 "${label}" 不存在` };
+  return {
+    success: true,
+    data: {
+      label,
+      description: block.description || '',
+      value: block.value || '',
+      chars_current: (block.value || '').length,
+      chars_limit: block.chars_limit || DEFAULT_MEMORY_LIMIT,
+      read_only: Boolean(block.read_only),
+      updatedAt: block.updatedAt || Date.now(),
+    },
+  };
+}
+
+function setMemoryBlock(label, description, value, options) {
+  if (!label || typeof label !== 'string') {
+    return { success: false, error: 'label 不能为空' };
+  }
+  const blocks = loadMemoryBlocks();
+  const existing = blocks[label];
+  if (existing && existing.read_only) {
+    return { success: false, error: `记忆块 "${label}" 是只读的，不能修改` };
+  }
+  blocks[label] = {
+    description: description || '',
+    value: value || '',
+    chars_limit: options?.chars_limit || DEFAULT_MEMORY_LIMIT,
+    read_only: Boolean(options?.read_only),
+    updatedAt: Date.now(),
+  };
+  saveMemoryBlocks(blocks);
+  return {
+    success: true,
+    data: {
+      label,
+      description: blocks[label].description,
+      value: blocks[label].value,
+      chars_current: blocks[label].value.length,
+      chars_limit: blocks[label].chars_limit,
+      read_only: blocks[label].read_only,
+      updatedAt: blocks[label].updatedAt,
+    },
+  };
+}
+
+function replaceMemoryBlockText(label, oldText, newText) {
+  if (!label || typeof label !== 'string') {
+    return { success: false, error: 'label 不能为空' };
+  }
+  if (!oldText || typeof oldText !== 'string') {
+    return { success: false, error: 'oldText 不能为空' };
+  }
+  const blocks = loadMemoryBlocks();
+  const block = blocks[label];
+  if (!block) return { success: false, error: `记忆块 "${label}" 不存在` };
+  if (block.read_only) {
+    return { success: false, error: `记忆块 "${label}" 是只读的，不能修改` };
+  }
+  const idx = block.value.indexOf(oldText);
+  if (idx === -1) {
+    return { success: false, error: `在记忆块 "${label}" 中找不到指定的 oldText` };
+  }
+  block.value = block.value.slice(0, idx) + newText + block.value.slice(idx + oldText.length);
+  block.updatedAt = Date.now();
+  saveMemoryBlocks(blocks);
+  return {
+    success: true,
+    data: {
+      label,
+      description: block.description,
+      value: block.value,
+      chars_current: block.value.length,
+      chars_limit: block.chars_limit,
+      read_only: block.read_only,
+      updatedAt: block.updatedAt,
+    },
+  };
+}
+
+function deleteMemoryBlock(label) {
+  if (!label || typeof label !== 'string') {
+    return { success: false, error: 'label 不能为空' };
+  }
+  const blocks = loadMemoryBlocks();
+  const block = blocks[label];
+  if (!block) return { success: false, error: `记忆块 "${label}" 不存在` };
+  if (block.read_only) {
+    return { success: false, error: `记忆块 "${label}" 是只读的，不能删除` };
+  }
+  delete blocks[label];
+  saveMemoryBlocks(blocks);
+  return { success: true };
 }
 
 function readSkillFile(entry) {
@@ -522,8 +1544,9 @@ function createOpenAIClient(config = {}) {
 }
 
 function createAnthropicClient(config = {}) {
-  const provider = new AnthropicProvider({
+  const provider = new Anthropic({
     apiKey: config.apiKey || 'empty',
+    baseUrl: config.baseURL || undefined,
   });
   return provider;
 }
@@ -813,12 +1836,13 @@ async function createChatResponse(
   traceId = createTraceId('chat'),
   signal,
 ) {
-  const providerType = config.providerType || 'openai';
+  const providerType = (config.providerType || 'openai').toString().trim().toLowerCase();
   const useStream = typeof handlers.onEvent === 'function';
 
   appendDebugLog('chat', 'request_start', {
     traceId,
     model: config?.model,
+    baseURL: config?.baseURL,
     messageCount: Array.isArray(messages) ? messages.length : 0,
     toolCount: Array.isArray(tools) ? tools.length : 0,
     stream: useStream,
@@ -972,150 +1996,489 @@ async function createAnthropicChatResponse(
   traceId = createTraceId('chat'),
   signal,
 ) {
-  const provider = createAnthropicClient(config);
-  const model = provider.chat(config.model);
+  appendDebugLog('chat', 'tools_count', { toolCount: tools?.length }, 'info');
   const useStream = typeof handlers.onEvent === 'function';
+  let baseURL = (config.baseURL || 'https://api.anthropic.com/v1').replace(/\/$/, '');
+  if (!baseURL.includes('/v1')) {
+    baseURL = baseURL + '/v1';
+  }
+  const apiKey = config.apiKey || 'empty';
 
   const anthropicTools = tools && tools.length > 0 ? convertToolsToAnthropic(tools) : null;
+  const anthropicPrompt = convertMessagesToAnthropic(messages);
 
-  const requestOptions = {
-    messages: convertMessagesToAnthropic(messages),
+  const requestBody = {
+    model: config.model,
     max_tokens: 4096,
+    messages: anthropicPrompt.messages,
   };
+
+  if (anthropicPrompt.system) {
+    requestBody.system = anthropicPrompt.system;
+  }
 
   if (anthropicTools) {
-    requestOptions.tools = anthropicTools;
+    requestBody.tools = anthropicTools;
   }
 
-  if (useStream) {
-    requestOptions.stream = true;
-  }
+  const url = `${baseURL}/messages`;
 
-  const response = await model.generate(requestOptions);
+  return new Promise((resolve, reject) => {
+    const isHttps = url.startsWith('https://');
+    const httpModule = isHttps ? https : http;
 
-  if (!useStream) {
-    const content = response.content;
-    const finishReason = response.stop_reason;
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || (isHttps ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'tools-2024-04-04',
+      },
+    };
 
-    appendDebugLog('chat', 'request_finish', {
-      traceId,
-      mode: 'non_stream',
-      providerType: 'anthropic',
-      finishReason,
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        req.destroy();
+      });
+    }
+
+    const req = httpModule.request(options, (res) => {
+      if (!useStream) {
+        let body = '';
+        res.on('data', (chunk) => body += chunk);
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            appendDebugLog('chat', 'error', { traceId, status: res.statusCode, body }, 'error');
+            reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+            return;
+          }
+          try {
+            const response = JSON.parse(body);
+            const content = response.content || [];
+            let text = '';
+            const toolCalls = [];
+
+            for (const block of content) {
+              if (block.type === 'text') {
+                text += block.text || '';
+              } else if (block.type === 'tool_use') {
+                toolCalls.push({
+                  id: block.id,
+                  type: 'function',
+                  function: {
+                    name: block.name,
+                    arguments: block.input ? JSON.stringify(block.input) : '{}',
+                  },
+                });
+              }
+            }
+
+            appendDebugLog('chat', 'request_finish', {
+              traceId,
+              mode: 'non_stream',
+              providerType: 'anthropic',
+              finishReason: response.stop_reason,
+            });
+
+            resolve(normalizeAssistantMessage({
+              role: 'assistant',
+              content: text || null,
+              tool_calls: toolCalls,
+            }));
+          } catch (e) {
+            reject(new Error(`Failed to parse response: ${e.message}`));
+          }
+        });
+      } else {
+        if (res.statusCode !== 200) {
+          let errorBody = '';
+          res.on('data', (chunk) => { errorBody += chunk; });
+          res.on('end', () => {
+            appendDebugLog('chat', 'error', { traceId, status: res.statusCode, body: errorBody }, 'error');
+            reject(new Error(`HTTP ${res.statusCode}: ${errorBody.slice(0, 500)}`));
+          });
+          return;
+        }
+
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          appendDebugLog('chat.stream', 'response_body', { bodyLength: body.length, bodyPreview: body.slice(0, 200) }, 'info');
+
+          // Check if it's SSE format or complete JSON
+          if (body.includes('\n') || body.startsWith('data:')) {
+            // SSE format
+            const finalMessage = {
+              role: 'assistant',
+              content: '',
+              tool_calls: [],
+            };
+            let contentDeltaCount = 0;
+            let finishReason = null;
+            const toolCallIndexByContentBlock = Object.create(null);
+
+            const lines = body.split('\n');
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+
+              try {
+                const event = JSON.parse(data);
+
+                if (event.type === 'content_block_start') {
+                  const block = event.content_block;
+                  appendDebugLog('chat.stream', 'content_block_start', { blockType: block?.type, blockKeys: block ? Object.keys(block) : [], index: event.index }, 'info');
+                  if (block && block.type === 'tool_use') {
+                    const toolId = block.id || block.tool_use_id || block.name;
+                    const toolCallIndex = finalMessage.tool_calls.push({
+                      id: toolId || `tool_${event.index}`,
+                      type: 'function',
+                      function: {
+                        name: block.name || `unknown_tool_${event.index}`,
+                        arguments: '',
+                      },
+                    }) - 1;
+                    toolCallIndexByContentBlock[event.index] = toolCallIndex;
+                  }
+                } else if (event.type === 'content_block_delta') {
+                  const delta = event.delta;
+                  if (delta && delta.type === 'text_delta' && delta.text) {
+                    contentDeltaCount += 1;
+                    finalMessage.content += delta.text;
+                    emitChatEvent(handlers, { type: 'content_delta', delta: delta.text });
+                  } else if (delta && delta.type === 'thinking_delta') {
+                    // Skip MiniMax extended thinking
+                  } else if (delta && delta.type === 'input_json_delta') {
+                    // Tool arguments come through as input_json_delta
+                    const tcIndex = toolCallIndexByContentBlock[event.index];
+                    if (tcIndex !== undefined && finalMessage.tool_calls[tcIndex]) {
+                      finalMessage.tool_calls[tcIndex].function.arguments += delta.input_json || '';
+                    }
+                  }
+                } else if (event.type === 'message_delta') {
+                  if (event.delta?.stop_reason) {
+                    finishReason = event.delta.stop_reason;
+                  }
+                }
+              } catch (e) {
+                // Skip
+              }
+            }
+
+            if (finishReason) {
+              emitChatEvent(handlers, { type: 'finish', finishReason });
+            }
+
+            appendDebugLog('chat', 'request_finish', {
+              traceId,
+              mode: 'stream',
+              contentDeltaCount,
+              finalContentLength: finalMessage.content.length,
+              toolCallCount: finalMessage.tool_calls.length,
+              finishReason,
+            });
+
+            resolve(normalizeAssistantMessage(finalMessage));
+          } else {
+            // Complete JSON response (non-streaming)
+            try {
+              const response = JSON.parse(body);
+              const content = response.content || [];
+              let text = '';
+              const toolCalls = [];
+
+              for (const block of content) {
+                if (block.type === 'text') {
+                  text += block.text || '';
+                } else if (block.type === 'tool_use') {
+                  toolCalls.push({
+                    id: block.id,
+                    type: 'function',
+                    function: {
+                      name: block.name,
+                      arguments: block.input ? JSON.stringify(block.input) : '{}',
+                    },
+                  });
+                }
+              }
+
+              if (text) {
+                emitChatEvent(handlers, { type: 'content_delta', delta: text });
+              }
+              emitChatEvent(handlers, { type: 'finish', finishReason: response.stop_reason || 'stop' });
+
+              appendDebugLog('chat', 'request_finish', {
+                traceId,
+                mode: 'non_stream_fallback',
+                contentLength: text.length,
+                finishReason: response.stop_reason,
+              });
+
+              resolve(normalizeAssistantMessage({
+                role: 'assistant',
+                content: text || null,
+                tool_calls: toolCalls,
+              }));
+            } catch (e) {
+              appendDebugLog('chat', 'parse_error', { error: e.message, body: body.slice(0, 200) }, 'error');
+              reject(new Error(`Failed to parse response: ${e.message}`));
+            }
+          }
+        });
+      }
     });
 
-    return convertAnthropicResponseToAssistant(content, finishReason);
-  }
+    req.on('error', (e) => {
+      appendDebugLog('chat', 'request_network_error', { traceId, error: e.message }, 'error');
+      reject(new Error(`Request failed: ${e.message}`));
+    });
 
-  const finalMessage = {
-    role: 'assistant',
-    content: '',
-    tool_calls: [],
-  };
+    req.on('socket', (socket) => {
+      appendDebugLog('chat', 'request_socket', { traceId, remoteAddress: socket.remoteAddress }, 'info');
+    });
 
-  var contentDeltaCount = 0;
-  var toolDeltaCount = 0;
-  var finishReason = null;
-
-  for await (const chunk of response) {
-    if (signal?.aborted) {
-      const abortError = new Error('request aborted');
-      abortError.name = 'AbortError';
-      throw abortError;
-    }
-
-    if (chunk.type === 'content_delta') {
-      const deltaText = typeof chunk.text === 'string' ? chunk.text : '';
-      if (deltaText) {
-        contentDeltaCount += 1;
-        finalMessage.content += deltaText;
-        emitChatEvent(handlers, { type: 'content_delta', delta: deltaText });
-      }
-    }
-
-    if (chunk.type === 'tool_use') {
-      const toolCallDelta = {
-        index: toolDeltaCount,
-        id: chunk.id,
-        type: 'function',
-        function: {
-          name: chunk.name,
-          arguments: '',
-        },
-      };
-      mergeToolCallDelta(finalMessage, toolCallDelta);
-      toolDeltaCount += 1;
-    }
-
-    if (chunk.type === 'tool_result') {
-      // Tool result, no delta needed
-    }
-
-    if (chunk.type === 'message_delta') {
-      if (chunk.delta?.stop_reason) {
-        finishReason = chunk.delta.stop_reason;
-      }
-    }
-  }
-
-  if (finalMessage.tool_calls.length && !finalMessage.content?.trim?.()) {
-    finalMessage.content = null;
-  }
-
-  if (finishReason) {
-    emitChatEvent(handlers, { type: 'finish', finishReason });
-  }
-
-  appendDebugLog('chat', 'request_finish', {
-    traceId,
-    mode: 'stream',
-    providerType: 'anthropic',
-    contentDeltaCount,
-    toolDeltaCount,
-    finalToolCalls: finalMessage.tool_calls.length,
-    finishReason,
+    appendDebugLog('chat', 'request_sending', { traceId, url }, 'info');
+    req.write(JSON.stringify(requestBody));
+    req.end();
+    appendDebugLog('chat', 'request_sent', { traceId }, 'info');
   });
+}
 
-  return normalizeAssistantMessage(finalMessage);
+function convertMessagePartToAnthropicBlock(part) {
+  if (part == null) {
+    return null;
+  }
+  if (typeof part === 'string') {
+    return part ? { type: 'text', text: part } : null;
+  }
+  if (part.type === 'text' && typeof part.text === 'string') {
+    return part.text ? { type: 'text', text: part.text } : null;
+  }
+  if (part.type === 'image_url') {
+    const rawUrl = String(part.image_url?.url || '').trim();
+    const match = rawUrl.match(/^data:([^;]+);base64,(.+)$/i);
+    if (!match) {
+      return null;
+    }
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: match[1],
+        data: match[2],
+      },
+    };
+  }
+  return null;
+}
+
+function convertMessageContentToAnthropicBlocks(content) {
+  const parts = Array.isArray(content) ? content : [content];
+  const blocks = [];
+  for (const part of parts) {
+    const block = convertMessagePartToAnthropicBlock(part);
+    if (block) {
+      blocks.push(block);
+    }
+  }
+  return blocks;
+}
+
+function parseAnthropicToolInput(rawArguments) {
+  if (rawArguments == null || rawArguments === '') {
+    return {};
+  }
+  if (typeof rawArguments === 'object' && !Array.isArray(rawArguments)) {
+    return rawArguments;
+  }
+  if (typeof rawArguments !== 'string') {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(rawArguments);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringifyAnthropicContent(content) {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (content == null) {
+    return '';
+  }
+  const text = extractContentText(content);
+  if (text) {
+    return text;
+  }
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+function pushAnthropicMessage(target, role, blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return;
+  }
+  const lastMessage = target[target.length - 1];
+  if (lastMessage && lastMessage.role === role && Array.isArray(lastMessage.content)) {
+    lastMessage.content = lastMessage.content.concat(blocks);
+    return;
+  }
+  target.push({ role, content: blocks });
 }
 
 function convertMessagesToAnthropic(messages) {
   const result = [];
-  for (const msg of messages) {
+  const systemParts = [];
+
+  for (const msg of messages || []) {
+    if (!msg) {
+      continue;
+    }
+
     if (msg.role === 'system') {
-      result.push({ role: 'user', content: msg.content });
-    } else {
-      result.push(msg);
+      const text = stringifyAnthropicContent(msg.content).trim();
+      if (text) {
+        systemParts.push(text);
+      }
+      continue;
+    }
+
+    if (msg.role === 'tool') {
+      const toolUseId = String(msg.tool_call_id ?? msg.toolUseId ?? '').trim();
+      if (!toolUseId) {
+        continue;
+      }
+      pushAnthropicMessage(result, 'user', [{
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: stringifyAnthropicContent(msg.content),
+      }]);
+      continue;
+    }
+
+    if (msg.role === 'assistant') {
+      const blocks = convertMessageContentToAnthropicBlocks(msg.content);
+      const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+      for (let index = 0; index < toolCalls.length; index += 1) {
+        const toolCall = toolCalls[index];
+        const toolName = String(toolCall?.function?.name ?? toolCall?.name ?? '').trim();
+        if (!toolName) {
+          continue;
+        }
+        blocks.push({
+          type: 'tool_use',
+          id: String(toolCall?.id ?? '').trim() || `tool_${result.length}_${index}`,
+          name: toolName,
+          input: parseAnthropicToolInput(toolCall?.function?.arguments ?? toolCall?.arguments),
+        });
+      }
+      pushAnthropicMessage(result, 'assistant', blocks);
+      continue;
+    }
+
+    if (msg.role === 'user') {
+      pushAnthropicMessage(result, 'user', convertMessageContentToAnthropicBlocks(msg.content));
     }
   }
-  return result;
+
+  return {
+    system: systemParts.length ? systemParts.join('\n\n') : undefined,
+    messages: result,
+  };
+}
+
+function convertMessagesToAnthropicPrompt(messages) {
+  const prompt = [];
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      prompt.push({ role: 'system', content: msg.content });
+    } else if (msg.role === 'user') {
+      const content = typeof msg.content === 'string'
+        ? [{ type: 'text', text: msg.content }]
+        : msg.content;
+      prompt.push({ role: 'user', content });
+    } else if (msg.role === 'assistant') {
+      const content = typeof msg.content === 'string'
+        ? [{ type: 'text', text: msg.content }]
+        : msg.content;
+      prompt.push({ role: 'assistant', content });
+    }
+  }
+  return prompt;
 }
 
 function convertToolsToAnthropic(tools) {
-  return tools.map(tool => {
+  return tools.map((tool, index) => {
+    if (!tool) {
+      return null;
+    }
+
+    let name, description, parameters;
+
+    // Handle various formats
+    if (tool.type === 'function' && tool.function) {
+      name = tool.function.Name || tool.function.name;
+      description = tool.function.description;
+      parameters = tool.function.parameters;
+    } else if (tool.type === 'function') {
+      name = tool.Name || tool.name;
+      description = tool.description;
+      parameters = tool.parameters;
+    } else {
+      name = tool.Name || tool.name;
+      description = tool.description;
+      parameters = tool.parameters;
+    }
+
+    // Try to get name from title in parameters if name is still missing
+    if ((!name || !String(name).trim()) && parameters?.title) {
+      name = String(parameters.title).replace(/Arguments$/, '');
+    }
+
+    // Fallback: if still no name, try to get from description or use index
+    if (!name || !String(name).trim()) {
+      name = `tool_${index}`;
+    }
+
     const properties = {};
     const required = [];
-    if (tool.parameters?.properties) {
-      for (const [name, prop] of Object.entries(tool.parameters.properties)) {
-        properties[name] = {
-          type: prop.type || 'string',
-          description: prop.description || '',
+    if (parameters?.properties) {
+      for (const [propName, prop] of Object.entries(parameters.properties)) {
+        if (!propName || !String(propName).trim()) {
+          continue;
+        }
+        properties[propName] = {
+          type: prop && prop.type ? prop.type : 'string',
+          description: prop && prop.description ? prop.description : (prop && prop.title ? prop.title : ''),
         };
-        if (tool.parameters.required?.includes(name)) {
-          required.push(name);
+        if (parameters.required?.includes(propName)) {
+          required.push(propName);
         }
       }
     }
+
     return {
-      name: tool.name,
-      description: tool.description || '',
+      name: String(name).trim(),
+      description: description || '',
       input_schema: {
         type: 'object',
         properties,
         required,
       },
     };
-  });
+  }).filter(Boolean);
 }
 
 function convertAnthropicResponseToAssistant(content, finishReason) {
@@ -2384,6 +3747,12 @@ function startBackgroundBash(command, cwd, options = {}) {
       durationMs: record.endedAt - record.startedAt,
       status: record.status,
     });
+    if (bashNotificationEnabled) {
+      const title = 'Bash ' + record.status;
+      const desc = record.description || record.command;
+      const truncatedDesc = desc.length > 60 ? desc.substring(0, 60) + '...' : desc;
+      showWindowsNotification(title, truncatedDesc);
+    }
   });
 
   appendDebugLog('bash.bg', 'started', {
@@ -3248,6 +4617,332 @@ function normalizeInitialWorkingDirectory() {
 
 normalizeInitialWorkingDirectory();
 
+// ============================================================
+// Bash Notification - Windows native toast notifications
+// ============================================================
+let bashNotificationEnabled = false;
+
+function showWindowsNotification(title, body) {
+  if (process.platform !== 'win32') return;
+  const escapedTitle = String(title || 'Kuke Agent').replace(/'/g, "''");
+  const escapedBody = String(body || '').replace(/'/g, "''");
+  const psScript = `
+    Add-Type -AssemblyName System.Windows.Forms;
+    $notify = New-Object System.Windows.Forms.NotifyIcon;
+    $notify.Icon = [System.Drawing.SystemIcons]::Information;
+    $notify.Visible = $true;
+    $notify.ShowBalloonTip(5000, '${escapedTitle}', '${escapedBody}', 'Info');
+    Start-Sleep -Seconds 6;
+    $notify.Dispose()
+  `;
+  try {
+    spawn('powershell.exe', ['-Command', psScript], {
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  } catch (e) {
+    appendDebugLog('notification', 'windows_error', { message: safeErrorMessage(e) }, 'error');
+  }
+}
+
+// ============================================================
+// BackgroundTaskManager - persists tasks that survive window close
+// ============================================================
+const BACKGROUND_TASKS_FILE = path.join(os.homedir(), '.kukeagent', 'background_tasks.json');
+const BACKGROUND_TASKS_DIR = path.join(os.homedir(), '.kukeagent');
+
+function ensureBackgroundTasksDir() {
+  try {
+    if (!fs.existsSync(BACKGROUND_TASKS_DIR)) {
+      fs.mkdirSync(BACKGROUND_TASKS_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function loadBackgroundTasks() {
+  ensureBackgroundTasksDir();
+  try {
+    if (fs.existsSync(BACKGROUND_TASKS_FILE)) {
+      const data = fs.readFileSync(BACKGROUND_TASKS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+function saveBackgroundTasks(tasks) {
+  ensureBackgroundTasksDir();
+  try {
+    fs.writeFileSync(BACKGROUND_TASKS_FILE, JSON.stringify(tasks, null, 2), 'utf-8');
+  } catch (error) {
+    appendDebugLog('bg_task', 'save_error', { message: safeErrorMessage(error) }, 'error');
+  }
+}
+
+const BackgroundTaskManager = {
+  _tasks: null,
+  _listeners: new Set(),
+
+  _load() {
+    if (this._tasks === null) {
+      this._tasks = loadBackgroundTasks();
+    }
+    return this._tasks;
+  },
+
+  _persist() {
+    saveBackgroundTasks(this._tasks);
+  },
+
+  _notifyChange() {
+    for (const listener of this._listeners) {
+      try { listener(this._tasks); } catch {}
+    }
+  },
+
+  onChange(listener) {
+    this._listeners.add(listener);
+    return () => { this._listeners.delete(listener); };
+  },
+
+  addTask(options = {}) {
+    const tasks = this._load();
+    const taskId = `btask_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const task = {
+      id: taskId,
+      title: String(options.title || options.name || '后台任务'),
+      description: String(options.description || ''),
+      status: 'pending',
+      createdAt: Date.now(),
+      startedAt: null,
+      completedAt: null,
+      result: null,
+      error: null,
+      progress: null,
+    };
+    tasks.push(task);
+    this._persist();
+    this._notifyChange();
+    appendDebugLog('bg_task', 'added', { taskId, title: task.title });
+    return { success: true, data: { taskId, task } };
+  },
+
+  updateTask(taskId, updates = {}) {
+    const tasks = this._load();
+    const idx = tasks.findIndex(t => t.id === taskId);
+    if (idx === -1) return { success: false, error: '任务不存在' };
+    const task = tasks[idx];
+    if (updates.status) task.status = updates.status;
+    if (updates.progress != null) task.progress = updates.progress;
+    if (updates.result != null) task.result = updates.result;
+    if (updates.error != null) task.error = updates.error;
+    if (updates.status === 'running' && !task.startedAt) task.startedAt = Date.now();
+    if (updates.status === 'completed' || updates.status === 'failed') task.completedAt = Date.now();
+    this._persist();
+    this._notifyChange();
+    appendDebugLog('bg_task', 'updated', { taskId, updates: Object.keys(updates) });
+    return { success: true, data: { task } };
+  },
+
+  getTask(taskId) {
+    const tasks = this._load();
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return { success: false, error: '任务不存在' };
+    return { success: true, data: task };
+  },
+
+  listTasks() {
+    return { success: true, data: this._load() };
+  },
+
+  removeTask(taskId) {
+    const tasks = this._load();
+    const idx = tasks.findIndex(t => t.id === taskId);
+    if (idx === -1) return { success: false, error: '任务不存在' };
+    tasks.splice(idx, 1);
+    this._persist();
+    this._notifyChange();
+    appendDebugLog('bg_task', 'removed', { taskId });
+    return { success: true };
+  },
+
+  clearCompleted() {
+    const tasks = this._load();
+    const before = tasks.length;
+    const remaining = tasks.filter(t => t.status !== 'completed' && t.status !== 'failed');
+    this._tasks = remaining;
+    this._persist();
+    this._notifyChange();
+    appendDebugLog('bg_task', 'cleared_completed', { removed: before - remaining.length });
+    return { success: true, data: { removed: before - remaining.length } };
+  },
+};
+
+// ============================================================
+// NotificationManager - system notifications via ZTools API
+// ============================================================
+const NOTIFICATIONS_FILE = path.join(os.homedir(), '.kukeagent', 'notifications.json');
+
+function ensureNotificationsDir() {
+  try {
+    if (!fs.existsSync(BACKGROUND_TASKS_DIR)) {
+      fs.mkdirSync(BACKGROUND_TASKS_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function loadNotifications() {
+  ensureNotificationsDir();
+  try {
+    if (fs.existsSync(NOTIFICATIONS_FILE)) {
+      const data = fs.readFileSync(NOTIFICATIONS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+function saveNotifications(notifications) {
+  ensureNotificationsDir();
+  try {
+    fs.writeFileSync(NOTIFICATIONS_FILE, JSON.stringify(notifications, null, 2), 'utf-8');
+  } catch (error) {
+    appendDebugLog('notification', 'save_error', { message: safeErrorMessage(error) }, 'error');
+  }
+}
+
+const NotificationManager = {
+  _notifications: null,
+  _listeners: new Set(),
+  _ztoolsNotify: null,
+
+  _load() {
+    if (this._notifications === null) {
+      this._notifications = loadNotifications();
+    }
+    return this._notifications;
+  },
+
+  _persist() {
+    saveNotifications(this._notifications);
+  },
+
+  _notifyChange() {
+    for (const listener of this._listeners) {
+      try { listener(this._notifications); } catch {}
+    }
+  },
+
+  onChange(listener) {
+    this._listeners.add(listener);
+    return () => { this._listeners.delete(listener); };
+  },
+
+  _getZToolsNotify() {
+    if (this._ztoolsNotify === null) {
+      if (typeof window !== 'undefined' && window.ztools && typeof window.ztools.notify === 'function') {
+        this._ztoolsNotify = window.ztools.notify.bind(window.ztools);
+      } else {
+        this._ztoolsNotify = false;
+      }
+    }
+    return this._ztoolsNotify;
+  },
+
+  notify(options = {}) {
+    const title = String(options.title || options.subject || 'Kuke Agent');
+    const body = String(options.body || options.message || '');
+    const notifId = `notif_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const notification = {
+      id: notifId,
+      title,
+      body,
+      type: options.type || 'info',
+      read: false,
+      createdAt: Date.now(),
+    };
+
+    const notifications = this._load();
+    notifications.unshift(notification);
+    if (notifications.length > 200) {
+      notifications.splice(200);
+    }
+    this._persist();
+    this._notifyChange();
+
+    const ztoolsNotify = this._getZToolsNotify();
+    if (ztoolsNotify) {
+      try {
+        ztoolsNotify({ title, body });
+      } catch (error) {
+        appendDebugLog('notification', 'ztools_error', { message: safeErrorMessage(error) }, 'error');
+      }
+    }
+
+    if (bashNotificationEnabled) {
+      showWindowsNotification(title, body);
+    }
+
+    appendDebugLog('notification', 'sent', { notifId, title, hasNative: !!ztoolsNotify, hasWindows: bashNotificationEnabled });
+    return { success: true, data: { notifId, notification } };
+  },
+
+  listNotifications(options = {}) {
+    const notifications = this._load();
+    const unreadOnly = Boolean(options?.unreadOnly);
+    const limit = Math.min(Math.max(Number(options?.limit) || 50, 1), 200);
+    let filtered = notifications;
+    if (unreadOnly) {
+      filtered = filtered.filter(n => !n.read);
+    }
+    return { success: true, data: filtered.slice(0, limit) };
+  },
+
+  markRead(notifId) {
+    const notifications = this._load();
+    const notif = notifications.find(n => n.id === notifId);
+    if (!notif) return { success: false, error: '通知不存在' };
+    notif.read = true;
+    this._persist();
+    this._notifyChange();
+    return { success: true };
+  },
+
+  markAllRead() {
+    const notifications = this._load();
+    for (const n of notifications) { n.read = true; }
+    this._persist();
+    this._notifyChange();
+    return { success: true };
+  },
+
+  removeNotification(notifId) {
+    const notifications = this._load();
+    const idx = notifications.findIndex(n => n.id === notifId);
+    if (idx === -1) return { success: false, error: '通知不存在' };
+    notifications.splice(idx, 1);
+    this._persist();
+    this._notifyChange();
+    return { success: true };
+  },
+
+  clearAll() {
+    this._notifications = [];
+    this._persist();
+    this._notifyChange();
+    return { success: true };
+  },
+
+  getUnreadCount() {
+    const notifications = this._load();
+    return { success: true, data: { count: notifications.filter(n => !n.read).length } };
+  },
+};
+
 let pendingLaunchPayload = null;
 const launchPayloadSubscribers = new Set();
 
@@ -3384,9 +5079,15 @@ window.localTools = {
     const providerType = config?.providerType || 'openai';
 
     if (providerType === 'anthropic') {
+      // Latest Claude 4 models + legacy Claude 3.5/3 models
       const models = [
-        'claude-3-5-haiku-20241017',
+        // Claude 4 models (latest)
+        'claude-opus-4-7',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
+        // Legacy Claude 3.5/3 models
         'claude-3-5-sonnet-20241022',
+        'claude-3-5-haiku-20241017',
         'claude-3-opus-20240229',
       ];
       appendDebugLog('models', 'success', {
@@ -3988,6 +5689,69 @@ window.localTools = {
     return { success: true };
   },
 
+  connectMcp: async (options) => {
+    const connectPromise = (async () => {
+      const url = options?.url;
+      if (url) {
+        const connectResult = connectMcpHttpServer(options);
+        if (!connectResult.success) return connectResult;
+        const initResult = await initializeMcpHttpServer(connectResult.data.serverId);
+        if (!initResult.success) return initResult;
+        const listResult = await listMcpHttpTools(connectResult.data.serverId);
+        if (!listResult.success) return listResult;
+        return { success: true, data: { ...connectResult.data, tools: listResult.data } };
+      }
+      const connectResult = connectMcpServer(options);
+      if (!connectResult.success) return connectResult;
+      const initResult = await initializeMcpServer(connectResult.data.serverId);
+      if (!initResult.success) return initResult;
+      const listResult = await listMcpTools(connectResult.data.serverId);
+      if (!listResult.success) return listResult;
+      return { success: true, data: { ...connectResult.data, tools: listResult.data } };
+    })();
+
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('MCP连接超时（30秒）')), 30000);
+    });
+
+    return Promise.race([connectPromise, timeoutPromise]);
+  },
+
+  connectMcpAsync: (options) => {
+    const url = options?.url;
+    if (url) {
+      const connectResult = connectMcpHttpServer(options);
+      if (!connectResult.success) return connectResult;
+      initializeMcpHttpServerAsync(connectResult.data.serverId);
+      return { success: true, data: { serverId: connectResult.data.serverId, name: connectResult.data.name, status: 'connecting' } };
+    }
+    const connectResult = connectMcpServer(options);
+    if (!connectResult.success) return connectResult;
+    initializeMcpServerAsync(connectResult.data.serverId);
+    return { success: true, data: { serverId: connectResult.data.serverId, name: connectResult.data.name, status: 'connecting' } };
+  },
+  disconnectMcp: (options) => {
+    const serverId = String(options?.serverId ?? '').trim();
+    if (!serverId) return { success: false, error: 'serverId 不能为空' };
+    return disconnectMcpServer(serverId);
+  },
+  listMcpServers,
+  listMcpTools: async (options) => {
+    const serverId = String(options?.serverId ?? '').trim();
+    if (!serverId) return { success: false, error: 'serverId 不能为空' };
+    return listMcpTools(serverId);
+  },
+  callMcpTool: async (options) => {
+    const serverId = String(options?.serverId ?? '').trim();
+    const toolName = String(options?.toolName ?? options?.name ?? '').trim();
+    const args = options?.arguments ?? options?.args ?? {};
+    if (!serverId) return { success: false, error: 'serverId 不能为空' };
+    if (!toolName) return { success: false, error: 'toolName 不能为空' };
+    return callMcpTool(serverId, toolName, args);
+  },
+  readMcpServerOutput,
+  getMcpServerLogs,
+
   discoverSkills,
   saveSkill: (options) => {
     const name = String(options?.name ?? '').trim();
@@ -4084,5 +5848,63 @@ window.localTools = {
     } catch (error) {
       return { success: false, error: safeErrorMessage(error) };
     }
+  },
+
+  // Bash notification setting
+  setBashNotificationEnabled: (enabled) => {
+    bashNotificationEnabled = Boolean(enabled);
+    return { success: true, data: { enabled: bashNotificationEnabled } };
+  },
+  getBashNotificationEnabled: () => {
+    return { success: true, data: { enabled: bashNotificationEnabled } };
+  },
+
+  // Background Task APIs
+  addBackgroundTask: (options) => BackgroundTaskManager.addTask(options),
+  updateBackgroundTask: (taskId, updates) => BackgroundTaskManager.updateTask(taskId, updates),
+  getBackgroundTask: (taskId) => BackgroundTaskManager.getTask(taskId),
+  listBackgroundTasks: () => BackgroundTaskManager.listTasks(),
+  removeBackgroundTask: (taskId) => BackgroundTaskManager.removeTask(taskId),
+  clearCompletedBackgroundTasks: () => BackgroundTaskManager.clearCompleted(),
+  onBackgroundTasksChange: (listener) => BackgroundTaskManager.onChange(listener),
+
+  // Notification APIs
+  sendNotification: (options) => NotificationManager.notify(options),
+  listNotifications: (options) => NotificationManager.listNotifications(options),
+  markNotificationRead: (notifId) => NotificationManager.markRead(notifId),
+  markAllNotificationsRead: () => NotificationManager.markAllRead(),
+  removeNotification: (notifId) => NotificationManager.removeNotification(notifId),
+  clearAllNotifications: () => NotificationManager.clearAll(),
+  getUnreadNotificationCount: () => NotificationManager.getUnreadCount(),
+  onNotificationsChange: (listener) => NotificationManager.onChange(listener),
+
+  // Memory APIs
+  listMemoryBlocks: () => listMemoryBlocks(),
+  getMemoryBlock: (options) => {
+    const label = String(options?.label ?? '').trim();
+    if (!label) return { success: false, error: 'label 不能为空' };
+    return getMemoryBlock(label);
+  },
+  setMemoryBlock: (options) => {
+    const label = String(options?.label ?? '').trim();
+    const description = String(options?.description ?? '').trim();
+    const value = String(options?.value ?? '');
+    const read_only = Boolean(options?.read_only);
+    const chars_limit = options?.chars_limit;
+    if (!label) return { success: false, error: 'label 不能为空' };
+    return setMemoryBlock(label, description, value, { chars_limit, read_only });
+  },
+  replaceMemoryBlockText: (options) => {
+    const label = String(options?.label ?? '').trim();
+    const oldText = String(options?.oldText ?? '');
+    const newText = String(options?.newText ?? '');
+    if (!label) return { success: false, error: 'label 不能为空' };
+    if (!oldText) return { success: false, error: 'oldText 不能为空' };
+    return replaceMemoryBlockText(label, oldText, newText);
+  },
+  deleteMemoryBlock: (options) => {
+    const label = String(options?.label ?? '').trim();
+    if (!label) return { success: false, error: 'label 不能为空' };
+    return deleteMemoryBlock(label);
   },
 };
